@@ -48,11 +48,28 @@ test('bonus code format is enforced', async () => {
 });
 
 test('anon key alone cannot read tables', async () => {
-  await rider(async (tx) => {
-    assert.equal((await tx.query('select * from riders')).rows.length, 0);
-    assert.equal((await tx.query('select * from claims')).rows.length, 0);
-    assert.equal((await tx.query('select * from rider_scores')).rows.length, 0);
-  });
+  for (const t of ['riders', 'claims', 'rider_scores', 'bonuses', 'settings', 'scorers']) {
+    await rejects(rider((tx) => tx.query(`select * from ${t}`)), /permission denied/);
+  }
+});
+
+test('table grants: scorers can do what the admin page does; non-scorers see nothing', async () => {
+  // Same operations as admin.html: settings update, riders/bonuses upsert, combos replaced
+  await scorer(async (tx) => {
+    await tx.query(`update settings set max_attempts = max_attempts`);
+    await tx.query(`insert into riders (rider_number, name) values (900, 'Grant Test')
+                    on conflict (rider_number) do update set name = excluded.name`);
+    await tx.query(`insert into bonuses (code, points) values ('GRNT', 5)
+                    on conflict (code) do update set points = excluded.points`);
+    await tx.query(`delete from combo_members where combo_code = 'GRNT'`);
+    for (const v of ['rider_scores', 'claims_detail', 'claim_events', 'scorers']) await tx.query(`select * from ${v}`);
+    throw new Error('rollback');
+  }).catch((e) => { if (e.message !== 'rollback') throw e; });
+
+  const stranger = (fn) => as('authenticated', 'random@example.com', fn);
+  assert.equal((await stranger((tx) => tx.query('select * from riders'))).rows.length, 0);
+  assert.equal((await stranger((tx) => tx.query('select * from rider_scores'))).rows.length, 0);
+  await rejects(stranger((tx) => tx.query(`insert into riders (rider_number, name) values (901, 'x')`)), /row-level security/);
 });
 
 test('rider session lists bonuses but hides penalties', async () => {
@@ -111,9 +128,7 @@ test('only scorers can decide; status rules and audit', async () => {
   assert.equal(c.decided_by, SCORER);
 
   await rejects(scorer((tx) => tx.query(`select scorer_decide($1, 'denied', 'blurry')`, [claim])), /Revert it to pending first/);
-  await rejects(scorer((tx) => tx.query(`update claims set photo_path = 'x' where id = $1`, [claim]).then(() => {
-    throw new Error('row-level security: update should not be allowed');
-  })), /row-level security|0 rows/);
+  await rejects(scorer((tx) => tx.query(`update claims set photo_path = 'x' where id = $1`, [claim])), /permission denied/);
 
   const reverted = await scorer((tx) => one(tx, `select * from scorer_decide($1, 'pending')`, [claim]));
   assert.equal(reverted.decided_by, null);

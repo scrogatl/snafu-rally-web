@@ -2,6 +2,7 @@
 -- so the real schema can run inside PGlite for tests.
 create role anon nologin;
 create role authenticated nologin;
+create role service_role nologin bypassrls;
 create schema auth;
 create function auth.jwt() returns jsonb language sql stable as $$
   select coalesce(nullif(current_setting('request.jwt.claims', true), ''), '{}')::jsonb
@@ -26,7 +27,8 @@ grant usage on schema storage to anon, authenticated;
 grant select, insert on storage.objects to anon, authenticated;
 grant execute on function storage.foldername(text) to anon, authenticated;
 
--- Supabase default privileges (tables open, RLS decides)
+-- Supabase default privileges. Tables get NO default grants here, as in a project created with
+-- "automatically expose new tables" turned off; schema.sql must grant table access itself.
+-- (Projects with it on also grant all on tables; schema.sql revokes that, so both cases end the same.)
 grant usage on schema public to anon, authenticated;
-alter default privileges in schema public grant all on tables to anon, authenticated;
 alter default privileges in schema public grant execute on functions to anon, authenticated;

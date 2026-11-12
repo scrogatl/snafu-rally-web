@@ -438,6 +438,20 @@ drop policy if exists scorer_read on claim_events;
 create policy scorer_read on claim_events for select to authenticated using (is_scorer());
 -- Claims change only through scorer_decide / scorer_add_claim / rider_submit (status rules + audit)
 
+-- Table and view access
+-- Explicit, so the schema works whether or not the project auto-exposes new tables to the Data API.
+-- Grants say which commands a role may try; the RLS policies above still decide which rows.
+-- anon gets no table access at all: riders and the leader board go through security definer functions.
+grant usage on schema public to anon, authenticated, service_role;
+revoke all on all tables in schema public from anon, authenticated;
+revoke all on all sequences in schema public from anon, authenticated;
+grant select, insert, update, delete on settings, riders, bonuses, combo_members to authenticated;
+grant select on scorers, claims, claim_events to authenticated;
+grant select on approved_direct, approved_effective, rider_scores, claims_detail to authenticated;
+grant usage, select on sequence riders_id_seq to authenticated;   -- admin CSV import adds riders
+grant all on all tables in schema public to service_role;
+grant all on all sequences in schema public to service_role;
+
 -- Function access
 -- Supabase grants anon/authenticated execute by default, so revoke from them explicitly
 revoke execute on all functions in schema public from public, anon, authenticated;
