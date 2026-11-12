@@ -1,128 +1,85 @@
 # snafu-rally-web
 
-Bonus claims and scoring for the SNAFU rally, without email subject lines or spreadsheet formulas.
-Riders submit from a personal link on their phone; scorers review in a browser; the database
-enforces the rules and calculates the leader board.
+Bonus claims and scoring for the SNAFU rally. Riders submit photos from a personal link on their
+phone, scorers approve or deny in a browser, and the database enforces the rules and calculates
+the leader board.
 
-**Status: barebones test build.** Location checks, offline queueing and QR printing are not in yet
-(see [Not in this build](#not-in-this-build)).
-
-```
-Rider phone (personal link)              Scorer laptop / phone (email sign-in)
-  pick bonus -> photo -> Submit             pending queue -> Approve / Deny / Revert
-        |                                          |
-        v                                          v
-  Supabase: Postgres (rules, audit, scores) + Storage (photos, private bucket)
-        |
-        v
-  Leader board (public page, live)
-```
-
-## Pages (`web/`)
+**Status: test build.** No location checks, offline queue or QR printing yet.
+Full design and rules: [SPEC.md](SPEC.md).
 
 | Page | Who | What |
 |---|---|---|
-| `rider.html?t=<token>` | Rider | Bonus list with status, search, photo submit. No login; the link is the key. |
-| `scorer.html` | Scorer | Pending queue with photos, approve/deny with reason, decided list with revert, add a claim for a rider. |
-| `admin.html` | Scorer | Event settings, CSV import (riders, bonuses, combos), rider links export, testing reset. |
-| `leaderboard.html` | Anyone | Live ranking, refreshes every 30 seconds. |
+| `rider.html?t=<token>` | Rider | Bonus list, score, photo submit. No login; the link is the key. |
+| `scorer.html` | Scorer | Approve / deny / revert claims, add a claim for a rider. |
+| `admin.html` | Scorer | Event settings, CSV import, rider links, testing reset. |
+| `leaderboard.html` | Anyone | Live ranking. |
 
-Plain HTML and JavaScript, no build step. Host the `web/` folder anywhere that serves static files.
+## Setup (about 15 minutes)
 
-## Rules the database enforces
+You need a free [Supabase](https://supabase.com) account and a free [Netlify](https://netlify.com)
+account connected to this GitHub repo.
 
-These used to depend on people typing things correctly. Now they can't be broken from the app.
+**1. Database (Supabase)**
 
-| Rule | Where |
-|---|---|
-| Bonus code is 4 letters, or 3 letters + 1 digit | `bonuses.code` check |
-| Rider identity comes from their link, not an email address | `rider_session` / `rider_submit` |
-| Rider picks a bonus from the list; unknown or penalty codes are rejected | `rider_submit` |
-| Photo required, except for combos | `rider_submit` |
-| Max attempts per bonus (default 3, set in Admin) | `rider_submit` |
-| No new claims once a bonus is approved | `rider_submit` |
-| A bonus can be approved only once per rider | unique index `claims_one_approved` |
-| Status moves pending -> approved/denied, and back to pending only (revert) | `claims_before_write` trigger |
-| Photo, rider and bonus on a claim can't be edited after submit | `claims_before_write` trigger |
-| Every submit, decision and revert is logged with who and when | `claim_events` |
-| A tapped-twice or retried submit never creates a duplicate | `claims.client_id` |
-| Riders can upload photos only into their own folder; only scorers can view photos | storage policies |
-| Only emails in `scorers` can see or change anything | row level security |
-
-**Scoring** matches the current sheet: sum of approved positive bonuses, then
-`x (1 + worst approved penalty / 100)`. A combo counts when all its members are approved
-or the combo itself is approved (never twice). Penalty bonuses (negative points) are hidden
-from riders; scorers add them with **Add claim**.
-
-## Set up for testing (about 15 minutes)
-
-1. **Create a Supabase project** at supabase.com (free plan is fine).
-2. **Create the database:** SQL Editor -> New query -> paste all of `supabase/schema.sql` -> Run.
-3. **Add yourself as a scorer** (same SQL Editor):
+1. Create a new Supabase project.
+2. SQL Editor -> New query -> paste all of `supabase/schema.sql` -> **Run**.
+3. Add each scorer email (lower case):
    ```sql
    insert into scorers (email) values ('you@example.com');
    ```
-   Use lower case. Repeat for each scorer.
-4. **Sign-in links:** Authentication -> URL Configuration
-   - Site URL: where you'll host the pages (for local testing `http://localhost:8080`)
-   - Redirect URLs: add `http://localhost:8080/**` and your hosted address with `/**`
-5. **Connect the pages:** Project Settings -> API has the Project URL and the `anon` `public` key.
-   - Hosted on Netlify from GitHub (recommended): New site -> Import from GitHub -> this repo. The
-     included `netlify.toml` sets the publish folder (`web`) and build command. Under Site configuration
-     -> Environment variables add `SUPABASE_URL` and `SUPABASE_ANON_KEY`; the build writes
-     `web/config.js` from them. Every push to `main` redeploys.
-   - Running the pages on your computer against the hosted project: put the two values into
-     `web/config.js` (but do not commit them; the committed file points at local Supabase).
-6. **Run it:**
-   - On your computer: `npm run serve` (or `python3 -m http.server 8080 -d web`), then open
-     http://localhost:8080/admin.html
-   - On phones: phones need an https address, so use the Netlify site. Add its address to the
-     Redirect URLs in step 4.
-7. **Load your rally data:** in Google Sheets, export each tab with File -> Download -> CSV, then in
-   Admin import **Riders**, then **Bonuses**, then **Combos**. Your existing column headers work as is
-   (`Rider Number, Name, Email` / `Bonus ID, POINTS` / `Combo ID, Member Bonus ID`). Optional extra
-   bonus columns: `Name`, `Description` (shown to riders). Try `samples/` first if you like.
-8. **Get rider links:** Admin -> Download links as CSV. Open one on your phone and submit a bonus,
-   then approve it on `scorer.html` and watch `leaderboard.html`.
+4. Project Settings -> API: copy the **Project URL** and the **anon public** key.
 
-To start testing over: Admin -> Testing reset (claims only), or run `supabase/reset.sql` then
-`schema.sql` again (everything).
+**2. Website (Netlify)**
 
-## Things to know
+1. Add new site -> Import from GitHub -> pick this repo. Leave the build settings as they are
+   (`netlify.toml` handles them).
+2. Site configuration -> Environment variables: add `SUPABASE_URL` and `SUPABASE_ANON_KEY`
+   with the values from step 1.4.
+3. Deploys -> Trigger deploy. Note the site address, e.g. `https://your-rally.netlify.app`.
 
-- **The anon key is public by design.** All it can do is call the rider functions with a valid
-  token, upload into that rider's folder, and read the leader board.
-- **Rider links are secrets.** Anyone with a rider's link can submit as that rider. Admin -> New link
-  cancels an old one.
-- **Photos are shrunk on the phone** (about 1600 px, roughly 300 KB) before upload. Photo metadata is not kept.
-- **Free plan:** projects pause after a week with no activity (resume from the dashboard, data is
-  kept); 1 GB of file storage, roughly 3,000 shrunk photos. For the event itself consider Pro for a month.
-- **Sign-in emails** use Supabase's built-in mail sender, which has a low hourly limit. Fine for a few
-  scorers; add your own SMTP under Authentication settings if you hit it.
-- **Bonuses can be added or changed any time**, including mid-event. Removing a bonus that has claims
-  is blocked on purpose.
+**3. Sign-in links (Supabase)**
 
-## Not in this build
+Authentication -> URL Configuration:
+- Site URL: your Netlify address
+- Redirect URLs: add `https://your-rally.netlify.app/**`
 
-- Location check against the bonus location (tabled; needs bonus coordinates and capture-time GPS)
-- Saving a submission on the phone to send automatically later (today: the entry is kept on screen; tap Submit again)
-- Printable QR codes for rider packets (use the links CSV with any QR mail-merge for now)
-- Bonus availability windows / time checks
-- Combos made of other combos (one level only)
+**4. Load the rally**
+
+1. Open `https://your-rally.netlify.app/admin.html` and sign in with your scorer email.
+2. From Google Sheets, export each tab with File -> Download -> CSV.
+3. Import in this order: **Riders**, **Bonuses**, **Combos**. The existing sheet headers work as is
+   (`Rider Number, Name, Email` / `Bonus ID, POINTS` / `Combo ID, Member Bonus ID`).
+   Not ready yet? Use the files in `samples/`.
+4. **Download links as CSV** and send each rider their link.
+
+**5. Try it:** open a rider link on your phone, submit a bonus, approve it in `scorer.html`,
+and check `leaderboard.html`.
+
+Every push to `main` redeploys the site.
+
+## Good to know
+
+- **The anon key is public by design.** The database only lets it use rider links, upload into
+  that rider's folder and read the leader board.
+- **Rider links are secrets.** Admin -> **New link** cancels a lost or shared one.
+- **Start over:** Admin -> Testing reset (claims only), or run `supabase/reset.sql` then
+  `supabase/schema.sql` (everything).
+- **Free plans:** Supabase pauses after a week idle (resume from the dashboard, data is kept) and
+  holds about 3,000 photos. Its built-in sign-in email has a low hourly limit; add SMTP under
+  Authentication if you hit it. Consider Supabase Pro for the event month.
 
 ## Development
 
+Needs Node 20+.
+
 ```
 npm install
-npm run test:setup  # one time, Chromium for the browser tests
-npm test            # database rules in an in-process Postgres + pages in headless Chromium
-npm run test:db     # database tests only
+npm run test:setup   # one time: Chromium for the browser tests
+npm test             # database rules (PGlite) + pages (headless Chromium)
+npm run serve        # pages at http://localhost:8080
 ```
 
-### Local Supabase (needs Docker)
-
-The committed `web/config.js` points at local Supabase, and `supabase/config.toml` allows sign-in
-links back to `http://localhost:8080`.
+`web/config.js` points at local Supabase. To run against it (needs Docker):
 
 ```
 npx supabase start
@@ -131,35 +88,10 @@ docker exec supabase_db_snafu-rally-web psql -U postgres -c "insert into scorers
 npm run serve
 ```
 
-- Sign-in emails are not really sent; open the local mail viewer (Mailpit) at http://127.0.0.1:54324.
-- Database browser (Studio): http://127.0.0.1:54323.
-- `npx supabase db reset` empties the database; load `schema.sql` and add your scorer email again.
-- Use `localhost` (not `127.0.0.1`) in the browser so the sign-in link returns to the same site.
-- `web/serve.json` turns off `serve`'s clean URLs, which would otherwise redirect
-  `rider.html?t=...` to `/rider` and drop the rider token.
-
-- `tests/schema.test.mjs` runs the real `supabase/schema.sql` in PGlite with small stand-ins for
-  Supabase's auth and storage schemas (`tests/supabase_stubs.sql`), switching between the anon,
-  rider, non-scorer and scorer roles.
-- `tests/web.test.mjs` loads the real pages in Chromium (Playwright) against a fake Supabase API and
-  checks the rider submit and retry flow, photo shrinking, scorer review, admin CSV import and the
-  leader board.
-
-## Files
-
-| Path | Purpose |
-|---|---|
-| `supabase/schema.sql` | Tables, rules, scoring views, functions, security, photo bucket |
-| `supabase/reset.sql` | Removes everything schema.sql created |
-| `supabase/config.toml` | Local Supabase settings (sign-in redirect to localhost:8080) |
-| `web/config.js` | Supabase URL and anon key (committed: local; hosted build overwrites it) |
-| `web/serve.json` | Keeps `npm run serve` from dropping the `?t=` rider token |
-| `netlify.toml`, `scripts/write-config.mjs` | Netlify build: writes `web/config.js` from environment variables |
-| `web/lib.js` | Shared code: Supabase client, photo shrinking, sign-in, messages |
-| `web/*.html`, `web/styles.css` | The four pages |
-| `samples/*.csv` | Example data in the same shape as the Google Sheets tabs |
-| `tests/` | Automated tests |
+Open http://localhost:8080/admin.html (use `localhost`, not `127.0.0.1`). Sign-in emails land in
+Mailpit at http://127.0.0.1:54324; Studio is at http://127.0.0.1:54323.
+To use a hosted project locally instead, put its values in `web/config.js` and do not commit them.
 
 ## License
 
-GNU General Public License v3.0 or later, same as snafu-rally-scoring. See [LICENSE](LICENSE).
+GNU General Public License v3.0 or later. See [LICENSE](LICENSE).

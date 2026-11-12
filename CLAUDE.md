@@ -4,6 +4,9 @@ Replacement for the Gmail + Apps Script + Google Sheets scoring in `scrogatl/sna
 Goal: make bonus scoring exact and hard to get wrong, instead of relying on email subject lines,
 labels and sheet formulas.
 
+Full build spec (schema, functions, pages, tests, exact messages): `SPEC.md`. Keep it in step with
+the code when behavior changes. Setup steps for people: `README.md`.
+
 ## Event profile (drives design choices)
 - About 40 riders, 10-hour rally, aimed at beginners. Keep the rider side dead simple.
 - Riders often lose signal; submitting later when back in coverage is acceptable.
