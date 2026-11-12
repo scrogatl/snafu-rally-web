@@ -66,13 +66,18 @@ from riders; scorers add them with **Add claim**.
 4. **Sign-in links:** Authentication -> URL Configuration
    - Site URL: where you'll host the pages (for local testing `http://localhost:8080`)
    - Redirect URLs: add `http://localhost:8080/**` and your hosted address with `/**`
-5. **Connect the pages:** Project Settings -> API. Copy the Project URL and the `anon` `public` key
-   into `web/config.js`.
+5. **Connect the pages:** Project Settings -> API has the Project URL and the `anon` `public` key.
+   - Hosted on Netlify from GitHub (recommended): New site -> Import from GitHub -> this repo. The
+     included `netlify.toml` sets the publish folder (`web`) and build command. Under Site configuration
+     -> Environment variables add `SUPABASE_URL` and `SUPABASE_ANON_KEY`; the build writes
+     `web/config.js` from them. Every push to `main` redeploys.
+   - Running the pages on your computer against the hosted project: put the two values into
+     `web/config.js` (but do not commit them; the committed file points at local Supabase).
 6. **Run it:**
    - On your computer: `npm run serve` (or `python3 -m http.server 8080 -d web`), then open
      http://localhost:8080/admin.html
-   - On phones: phones need an https address. Easiest is Netlify Drop (drag the `web` folder onto
-     app.netlify.com/drop) or Cloudflare Pages. Add that address to the Redirect URLs in step 4.
+   - On phones: phones need an https address, so use the Netlify site. Add its address to the
+     Redirect URLs in step 4.
 7. **Load your rally data:** in Google Sheets, export each tab with File -> Download -> CSV, then in
    Admin import **Riders**, then **Bonuses**, then **Combos**. Your existing column headers work as is
    (`Rider Number, Name, Email` / `Bonus ID, POINTS` / `Combo ID, Member Bonus ID`). Optional extra
@@ -109,9 +114,29 @@ To start testing over: Admin -> Testing reset (claims only), or run `supabase/re
 
 ```
 npm install
-npm test          # database rules in an in-process Postgres + pages in headless Chromium
-npm run test:db   # database tests only
+npm run test:setup  # one time, Chromium for the browser tests
+npm test            # database rules in an in-process Postgres + pages in headless Chromium
+npm run test:db     # database tests only
 ```
+
+### Local Supabase (needs Docker)
+
+The committed `web/config.js` points at local Supabase, and `supabase/config.toml` allows sign-in
+links back to `http://localhost:8080`.
+
+```
+npx supabase start
+docker exec -i supabase_db_snafu-rally-web psql -U postgres -q < supabase/schema.sql
+docker exec supabase_db_snafu-rally-web psql -U postgres -c "insert into scorers (email) values ('you@example.com')"
+npm run serve
+```
+
+- Sign-in emails are not really sent; open the local mail viewer (Mailpit) at http://127.0.0.1:54324.
+- Database browser (Studio): http://127.0.0.1:54323.
+- `npx supabase db reset` empties the database; load `schema.sql` and add your scorer email again.
+- Use `localhost` (not `127.0.0.1`) in the browser so the sign-in link returns to the same site.
+- `web/serve.json` turns off `serve`'s clean URLs, which would otherwise redirect
+  `rider.html?t=...` to `/rider` and drop the rider token.
 
 - `tests/schema.test.mjs` runs the real `supabase/schema.sql` in PGlite with small stand-ins for
   Supabase's auth and storage schemas (`tests/supabase_stubs.sql`), switching between the anon,
@@ -126,7 +151,10 @@ npm run test:db   # database tests only
 |---|---|
 | `supabase/schema.sql` | Tables, rules, scoring views, functions, security, photo bucket |
 | `supabase/reset.sql` | Removes everything schema.sql created |
-| `web/config.js` | Your Supabase URL and anon key |
+| `supabase/config.toml` | Local Supabase settings (sign-in redirect to localhost:8080) |
+| `web/config.js` | Supabase URL and anon key (committed: local; hosted build overwrites it) |
+| `web/serve.json` | Keeps `npm run serve` from dropping the `?t=` rider token |
+| `netlify.toml`, `scripts/write-config.mjs` | Netlify build: writes `web/config.js` from environment variables |
 | `web/lib.js` | Shared code: Supabase client, photo shrinking, sign-in, messages |
 | `web/*.html`, `web/styles.css` | The four pages |
 | `samples/*.csv` | Example data in the same shape as the Google Sheets tabs |

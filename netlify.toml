@@ -1,0 +1,6 @@
+# Netlify deploy from GitHub.
+# Set SUPABASE_URL and SUPABASE_ANON_KEY in Netlify -> Site configuration -> Environment variables.
+# The build writes web/config.js from them; the committed config.js stays on local Supabase values.
+[build]
+  publish = "web"
+  command = "node scripts/write-config.mjs"

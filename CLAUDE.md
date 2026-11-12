@@ -45,9 +45,17 @@ npm test             # all tests
 npm run test:db      # schema tests only (PGlite, no Docker, seconds)
 npm run serve        # pages at http://localhost:8080
 ```
-Local Supabase (optional): `npx supabase init`, copy `supabase/schema.sql` into `supabase/migrations/`,
-add `supabase/seed.sql`, `npx supabase start`, `npx supabase db reset` after SQL changes.
+Local Supabase: `supabase/config.toml` exists (redirects to localhost:8080). No migrations yet; load the
+schema with `docker exec -i supabase_db_snafu-rally-web psql -U postgres -q < supabase/schema.sql`
+and insert scorer emails by hand. Mail viewer (Mailpit) at :54324, Studio at :54323.
 If migrations become the source of truth, point `tests/schema.test.mjs` at them.
+
+## Config and hosting
+- Committed `web/config.js` = local Supabase values (public demo anon key). Do not commit hosted values.
+- Netlify deploys from GitHub: `netlify.toml` publishes `web/` and runs `scripts/write-config.mjs`,
+  which overwrites `web/config.js` from env vars `SUPABASE_URL` and `SUPABASE_ANON_KEY`.
+- `web/serve.json` sets `cleanUrls: false`; without it `npm run serve` redirects `rider.html?t=...`
+  to `/rider` and drops the token.
 
 ## Tests
 - `tests/schema.test.mjs`: runs the real schema in PGlite with stub auth/storage
