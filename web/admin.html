@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rally Admin</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+</head>
+<body>
+<main id="app"><p class="muted">Loading...</p></main>
+
+<script type="module">
+import { sb, $, esc, errorText, showMessage, setupBanner, currentScorer, renderLogin, navBar, wireSignOut } from './lib.js';
+setupBanner();
+const app = $('#app');
+
+// Column headers accepted for each import (lower case). The first name is what the
+// current Google Sheets use, so a tab exported with File > Download > CSV works as is.
+const KINDS = {
+  riders: {
+    title: 'Riders (Rider Master)',
+    cols: { rider_number: ['rider number', 'rider #', 'number'], name: ['name', 'rider name'], email: ['email'] },
+    required: ['rider_number', 'name'],
+  },
+  bonuses: {
+    title: 'Bonuses (Bonus Master)',
+    cols: { code: ['bonus id', 'code', 'bonus code'], points: ['points'], name: ['name', 'bonus name'], description: ['description', 'details'] },
+    required: ['code', 'points'],
+  },
+  combos: {
+    title: 'Combos (Combo Master)',
+    cols: { combo_code: ['combo id', 'combo', 'combo code'], member_code: ['member bonus id', 'member', 'member code'] },
+    required: ['combo_code', 'member_code'],
+  },
+};
+const parsed = {};
+
+async function start() {
+  let who;
+  try { who = await currentScorer(); } catch (e) { app.innerHTML = `<div class="msg error">${esc(errorText(e))}</div>`; return; }
+  if (!who.session) { renderLogin(app, start); return; }
+  if (!who.isScorer) { app.innerHTML = `${navBar('admin.html')}<div class="msg error">Not on the scorer list.</div>`; wireSignOut(); return; }
+
+  app.innerHTML = `${navBar('admin.html')}
+    <h1>Admin</h1>
+    <div class="card"><h2>Event</h2>
+      <form id="settings" class="stack">
+        <label class="stack"><span>Event name</span><input type="text" id="s-name" required></label>
+        <label class="stack"><span>Attempts allowed per bonus</span><input type="number" id="s-max" min="1" max="10" required></label>
+        <label class="row"><input type="checkbox" id="s-open" style="min-height:0;width:auto"> <span>Claims open</span></label>
+        <button type="submit">Save</button>
+      </form><div id="s-msg" class="msg" hidden></div></div>
+
+    <div class="card"><h2>Import from CSV</h2>
+      <p class="muted">Export each Google Sheets tab with File &gt; Download &gt; CSV. Import bonuses before combos.
+        Riders and bonuses are added or updated (rider links stay the same). Combos are replaced as a whole.</p>
+      ${Object.entries(KINDS).map(([k, v]) => `
+        <div class="stack" style="margin-top:12px">
+          <strong>${v.title}</strong>
+          <span class="muted">Columns: ${Object.values(v.cols).map((c) => c[0]).join(', ')}</span>
+          <div class="row"><input type="file" accept=".csv,text/csv" data-kind="${k}" class="grow">
+            <button type="button" data-import="${k}" disabled>Import</button></div>
+          <div id="p-${k}"></div>
+        </div>`).join('')}
+    </div>
+
+    <div class="card"><h2>Rider links</h2>
+      <p class="muted">Each rider opens their own link. Send it by text or email, or print it as a QR code in the rider packet.
+        "New link" makes the old one stop working.</p>
+      <div class="row"><button type="button" id="dl-links" class="secondary">Download links as CSV</button></div>
+      <div class="table-wrap"><table><thead><tr><th>#</th><th>Name</th><th>Link</th><th></th></tr></thead>
+        <tbody id="links"></tbody></table></div>
+    </div>
+
+    <div class="card"><h2>Testing reset</h2>
+      <p class="muted">Deletes every claim and its history. Riders, bonuses and links are kept. Photos stay in storage.</p>
+      <div class="row"><input type="text" id="del-confirm" class="grow" placeholder="Type DELETE ALL CLAIMS">
+        <button type="button" class="danger" id="del-btn">Delete all claims</button></div>
+      <div id="del-msg" class="msg" hidden></div>
+    </div>`;
+  wireSignOut();
+  await loadSettings();
+  await loadLinks();
+
+  $('#settings').addEventListener('submit', saveSettings);
+  app.querySelectorAll('[data-kind]').forEach((inp) => inp.addEventListener('change', () => preview(inp.dataset.kind, inp.files[0])));
+  app.querySelectorAll('[data-import]').forEach((b) => b.addEventListener('click', () => doImport(b.dataset.import, b)));
+  $('#dl-links').addEventListener('click', downloadLinks);
+  $('#links').addEventListener('click', newLink);
+  $('#del-btn').addEventListener('click', deleteClaims);
+}
+
+async function loadSettings() {
+  const { data, error } = await sb.from('settings').select('*').eq('id', 1).single();
+  if (error) { showMessage($('#s-msg'), errorText(error), 'error'); return; }
+  $('#s-name').value = data.event_name; $('#s-max').value = data.max_attempts; $('#s-open').checked = data.claims_open;
+}
+
+async function saveSettings(ev) {
+  ev.preventDefault();
+  const { error } = await sb.from('settings').update({
+    event_name: $('#s-name').value.trim(), max_attempts: Number($('#s-max').value), claims_open: $('#s-open').checked,
+  }).eq('id', 1);
+  showMessage($('#s-msg'), error ? errorText(error) : 'Saved.', error ? 'error' : 'ok');
+}
+
+// ---- CSV import ----
+function mapRows(kind, rows, headers) {
+  const spec = KINDS[kind];
+  const lower = headers.map((h) => String(h || '').trim().toLowerCase());
+  const idx = {};
+  for (const [field, names] of Object.entries(spec.cols)) idx[field] = lower.findIndex((h) => names.includes(h));
+  const missing = spec.required.filter((f) => idx[f] === -1);
+  if (missing.length) return { error: `Missing column: ${missing.map((f) => spec.cols[f][0]).join(', ')}. Found: ${headers.join(', ')}` };
+  const out = [];
+  rows.forEach((r) => {
+    if (r.every((c) => String(c || '').trim() === '')) return;
+    const o = {};
+    for (const [field, i] of Object.entries(idx)) o[field] = i === -1 ? null : String(r[i] ?? '').trim();
+    out.push(o);
+  });
+  return { rows: out };
+}
+
+async function validate(kind, rows) {
+  const errs = [];
+  const seen = new Set();
+  if (kind === 'riders') {
+    rows.forEach((r, i) => {
+      const n = Number(r.rider_number);
+      if (!Number.isInteger(n) || n <= 0) errs.push(`Row ${i + 2}: rider number "${r.rider_number}" is not a whole number`);
+      if (!r.name) errs.push(`Row ${i + 2}: name is blank`);
+      if (seen.has(n)) errs.push(`Row ${i + 2}: rider ${n} appears twice`);
+      seen.add(n);
+      r.rider_number = n; r.email = r.email ? r.email.toLowerCase() : null;
+    });
+  } else if (kind === 'bonuses') {
+    rows.forEach((r, i) => {
+      r.code = (r.code || '').toUpperCase();
+      if (!/^([A-Z]{4}|[A-Z]{3}[0-9])$/.test(r.code)) errs.push(`Row ${i + 2}: "${r.code}" is not 4 letters or 3 letters + 1 digit`);
+      if (!/^-?\d+$/.test(r.points || '')) errs.push(`Row ${i + 2}: points "${r.points}" is not a whole number`);
+      if (seen.has(r.code)) errs.push(`Row ${i + 2}: ${r.code} appears twice`);
+      seen.add(r.code);
+      r.points = Number(r.points); r.sort_order = i + 1;
+      r.name = r.name || null; r.description = r.description || null;
+    });
+  } else {
+    const { data } = await sb.from('bonuses').select('code');
+    const known = new Set((data || []).map((b) => b.code));
+    rows.forEach((r, i) => {
+      r.combo_code = (r.combo_code || '').toUpperCase(); r.member_code = (r.member_code || '').toUpperCase();
+      if (!known.has(r.combo_code)) errs.push(`Row ${i + 2}: combo ${r.combo_code} is not an imported bonus`);
+      if (!known.has(r.member_code)) errs.push(`Row ${i + 2}: member ${r.member_code} is not an imported bonus`);
+      if (r.combo_code === r.member_code) errs.push(`Row ${i + 2}: a combo cannot include itself`);
+      const key = r.combo_code + '/' + r.member_code;
+      if (seen.has(key)) errs.push(`Row ${i + 2}: ${key} appears twice`);
+      seen.add(key);
+    });
+  }
+  return errs;
+}
+
+function preview(kind, file) {
+  const box = $(`#p-${kind}`);
+  const btn = app.querySelector(`[data-import="${kind}"]`);
+  btn.disabled = true; parsed[kind] = null; box.innerHTML = '';
+  if (!file) return;
+  window.Papa.parse(file, {
+    skipEmptyLines: true,
+    complete: async (res) => {
+      const [headers, ...rows] = res.data;
+      const m = mapRows(kind, rows, headers || []);
+      if (m.error) { box.innerHTML = `<div class="msg error">${esc(m.error)}</div>`; return; }
+      const errs = await validate(kind, m.rows);
+      const fields = Object.keys(KINDS[kind].cols);
+      box.innerHTML = `
+        ${errs.length ? `<div class="msg error">${errs.slice(0, 20).map(esc).join('<br>')}${errs.length > 20 ? `<br>...and ${errs.length - 20} more` : ''}</div>`
+          : `<div class="msg ok">${m.rows.length} rows look good. Click Import.</div>`}
+        <div class="table-wrap"><table><thead><tr>${fields.map((f) => `<th>${esc(f)}</th>`).join('')}</tr></thead>
+        <tbody>${m.rows.slice(0, 8).map((r) => `<tr>${fields.map((f) => `<td>${esc(r[f])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
+        ${m.rows.length > 8 ? `<p class="muted">Showing 8 of ${m.rows.length}</p>` : ''}`;
+      if (!errs.length) { parsed[kind] = m.rows; btn.disabled = false; }
+    },
+  });
+}
+
+async function doImport(kind, btn) {
+  const rows = parsed[kind];
+  const box = $(`#p-${kind}`);
+  if (!rows) return;
+  btn.disabled = true;
+  let error;
+  if (kind === 'riders') {
+    ({ error } = await sb.from('riders').upsert(rows, { onConflict: 'rider_number' }));
+  } else if (kind === 'bonuses') {
+    ({ error } = await sb.from('bonuses').upsert(rows, { onConflict: 'code' }));
+  } else {
+    ({ error } = await sb.from('combo_members').delete().neq('combo_code', ''));
+    if (!error) ({ error } = await sb.from('combo_members').insert(rows));
+  }
+  box.innerHTML = error ? `<div class="msg error">${esc(errorText(error))}</div>`
+    : `<div class="msg ok">Imported ${rows.length} ${kind}.</div>`;
+  parsed[kind] = null;
+  if (kind === 'riders') loadLinks();
+}
+
+// ---- Rider links ----
+let riders = [];
+const linkFor = (t) => new URL(`rider.html?t=${t}`, location.href).href;
+
+async function loadLinks() {
+  const { data, error } = await sb.from('riders').select('rider_number,name,email,token').order('rider_number');
+  if (error) { $('#links').innerHTML = `<tr><td colspan="4">${esc(errorText(error))}</td></tr>`; return; }
+  riders = data;
+  $('#links').innerHTML = data.map((r) => `<tr><td>${esc(r.rider_number)}</td><td>${esc(r.name)}</td>
+    <td><a href="${esc(linkFor(r.token))}" target="_blank" rel="noopener">open</a></td>
+    <td><button type="button" class="link" data-newlink="${esc(r.rider_number)}">New link</button></td></tr>`).join('')
+    || '<tr><td colspan="4" class="muted">Import riders first.</td></tr>';
+}
+
+function downloadLinks() {
+  const csv = window.Papa.unparse(riders.map((r) => ({
+    'Rider Number': r.rider_number, Name: r.name, Email: r.email || '', Link: linkFor(r.token) })));
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  a.download = 'rider-links.csv';
+  a.click();
+}
+
+async function newLink(ev) {
+  const b = ev.target.closest('[data-newlink]');
+  if (!b) return;
+  b.disabled = true;
+  const { error } = await sb.rpc('scorer_new_token', { p_rider_number: Number(b.dataset.newlink) });
+  if (error) { b.textContent = errorText(error); return; }
+  loadLinks();
+}
+
+async function deleteClaims() {
+  const { data, error } = await sb.rpc('scorer_delete_all_claims', { p_confirm: $('#del-confirm').value.trim() });
+  showMessage($('#del-msg'), error ? errorText(error) : `Deleted ${data} claims.`, error ? 'error' : 'ok');
+}
+
+start();
+</script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+{
+  "name": "snafu-rally-web",
+  "version": "1.0.0",
+  "description": "SNAFU rally bonus claims and scoring: static web app + Supabase",
+  "scripts": {
+    "test:setup": "playwright install chromium",
+    "test": "node --test tests/schema.test.mjs tests/web.test.mjs",
+    "test:db": "node --test tests/schema.test.mjs",
+    "serve": "npx --yes serve web -l 8080"
+  },
+  "author": "",
+  "license": "GPL-3.0-or-later",
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.16",
+    "@supabase/supabase-js": "2.45.4",
+    "esbuild": "^0.28.2",
+    "papaparse": "^5.4.1",
+    "playwright": "^1.63.0"
+  },
+  "private": true,
+  "type": "module"
+}

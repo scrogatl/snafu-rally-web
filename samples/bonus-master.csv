@@ -1,0 +1,8 @@
+Bonus ID,POINTS,Name,Description
+ABCD,100,Old mill,Photo of the water wheel with your rally flag
+WXYZ,50,Covered bridge,Photo of the bridge sign
+ABC1,10,Gas stop,Receipt or pump photo
+ARSN,25,Mill and bridge combo,Awarded when ABCD and WXYZ are both approved
+LAT1,-25,Late under 15 min,Penalty - 25 percent off
+LAT2,-50,Late under 30 min,Penalty - 50 percent off
+LAT3,-100,Late over 30 min,Penalty - score zeroed

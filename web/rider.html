@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rally Bonuses</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<main>
+  <header id="head">
+    <h1 id="event-name">Rally Bonuses</h1>
+    <p class="muted" id="rider-line">Loading...</p>
+  </header>
+  <div id="page-msg" class="msg" hidden></div>
+
+  <!-- Bonus list -->
+  <section id="list-view" hidden>
+    <div class="card">
+      <input type="search" id="search" placeholder="Search bonus code or name" autocomplete="off">
+      <ul class="list" id="bonus-list"></ul>
+    </div>
+  </section>
+
+  <!-- Submit one bonus -->
+  <section id="claim-view" hidden>
+    <button type="button" class="link" id="back">&larr; All bonuses</button>
+    <div class="card stack">
+      <div>
+        <h2><span class="bonus-code" id="c-code"></span> <span id="c-name"></span></h2>
+        <p class="muted" id="c-meta"></p>
+        <p id="c-desc"></p>
+      </div>
+      <div id="c-blocked" class="msg warn" hidden></div>
+      <form id="claim-form" class="stack">
+        <label class="stack">
+          <span id="photo-label"><strong>Photo</strong></span>
+          <input type="file" id="photo" accept="image/*">
+        </label>
+        <img id="preview" class="photo-preview" alt="Selected photo" hidden>
+        <label class="stack">
+          <span>Note for the scorer (optional)</span>
+          <textarea id="note" maxlength="500" placeholder="Anything the scorer should know"></textarea>
+        </label>
+        <button type="submit" class="big" id="submit-btn">Submit bonus</button>
+      </form>
+      <div id="claim-msg" class="msg" hidden></div>
+    </div>
+  </section>
+</main>
+
+<script type="module">
+import { sb, $, esc, errorText, showMessage, setupBanner, shrinkImage, newId, BUCKET } from './lib.js';
+setupBanner();
+
+// Token comes from the personal link (?t=...). Remember it so a home screen icon works later.
+const params = new URLSearchParams(location.search);
+let token = params.get('t');
+try {
+  if (token) localStorage.setItem('rally_token', token);
+  else token = localStorage.getItem('rally_token');
+} catch (e) { /* private mode: link must be used each time */ }
+
+let session = null;
+let current = null;     // bonus being claimed
+let draft = null;       // { clientId, file, uploadedPath } kept across retries
+
+const statusLabel = {
+  approved: ['approved', 'Approved'],
+  pending: ['pending', 'Waiting for review'],
+  denied: ['denied', 'Denied - you can try again'],
+};
+
+async function load() {
+  if (!token) {
+    showMessage($('#page-msg'), 'Open this page from your personal rider link.', 'error');
+    $('#rider-line').textContent = '';
+    return;
+  }
+  const { data, error } = await sb.rpc('rider_session', { p_token: token });
+  if (error) {
+    showMessage($('#page-msg'), errorText(error), 'error');
+    $('#rider-line').textContent = '';
+    return;
+  }
+  session = data;
+  document.title = data.event_name;
+  $('#event-name').textContent = data.event_name;
+  $('#rider-line').textContent = `Rider ${data.rider.number} - ${data.rider.name}`;
+  if (!data.claims_open) showMessage($('#page-msg'), 'Claims are closed.', 'warn');
+  else showMessage($('#page-msg'), '');
+  renderList();
+  if (current) openClaim(current.code, true);
+  else $('#list-view').hidden = false;
+}
+
+function renderList() {
+  const q = $('#search').value.trim().toLowerCase();
+  const items = session.bonuses.filter((b) =>
+    !q || b.code.toLowerCase().includes(q) || (b.name || '').toLowerCase().includes(q));
+  $('#bonus-list').innerHTML = items.map((b) => {
+    const [cls, label] = statusLabel[b.status] || ['', ''];
+    return `<li><button type="button" class="bonus-btn" data-code="${esc(b.code)}">
+      <span><span class="bonus-code">${esc(b.code)}</span> ${esc(b.name || '')}
+        <br><span class="muted">${esc(b.points)} pts${b.is_combo ? ' - combo' : ''}</span></span>
+      ${label ? `<span class="badge ${cls}">${label}</span>` : ''}
+    </button></li>`;
+  }).join('') || '<li class="muted" style="padding:12px 4px">No bonuses match.</li>';
+}
+
+function openClaim(code, keepDraft = false) {
+  current = session.bonuses.find((b) => b.code === code);
+  if (!current) return;
+  if (!keepDraft) {
+    draft = null;
+    $('#claim-form').reset();
+    $('#preview').hidden = true;
+    showMessage($('#claim-msg'), '');
+  }
+  $('#c-code').textContent = current.code;
+  $('#c-name').textContent = current.name || '';
+  $('#c-meta').textContent = `${current.points} pts` +
+    (current.attempts ? ` - ${current.attempts} of ${session.max_attempts} attempts used` : '');
+  $('#c-desc').textContent = current.description || '';
+  $('#photo-label').innerHTML = current.is_combo
+    ? '<strong>Photo</strong> (not needed for a combo)'
+    : '<strong>Photo</strong> (required)';
+
+  let blocked = '';
+  if (!session.claims_open) blocked = 'Claims are closed.';
+  else if (current.status === 'approved') blocked = 'This bonus is already approved for you.';
+  else if (current.attempts >= session.max_attempts) blocked = 'You have used all attempts for this bonus. See rally staff.';
+  showMessage($('#c-blocked'), blocked, 'warn');
+  $('#claim-form').hidden = !!blocked && !keepDraft;
+
+  $('#list-view').hidden = true;
+  $('#claim-view').hidden = false;
+  window.scrollTo(0, 0);
+}
+
+$('#search').addEventListener('input', renderList);
+$('#bonus-list').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('[data-code]');
+  if (btn) openClaim(btn.dataset.code);
+});
+$('#back').addEventListener('click', () => {
+  current = null; draft = null;
+  $('#claim-view').hidden = true;
+  $('#list-view').hidden = false;
+});
+
+$('#photo').addEventListener('change', () => {
+  const f = $('#photo').files[0];
+  draft = f ? { clientId: newId(), file: f, uploadedPath: null } : null;
+  const img = $('#preview');
+  if (f) { img.src = URL.createObjectURL(f); img.hidden = false; } else { img.hidden = true; }
+});
+
+$('#claim-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const msg = $('#claim-msg');
+  const btn = $('#submit-btn');
+  const needsPhoto = !current.is_combo;
+  if (needsPhoto && !draft) { showMessage(msg, 'Add a photo first.', 'error'); return; }
+  if (!draft) draft = { clientId: newId(), file: null, uploadedPath: null };
+
+  btn.disabled = true;
+  try {
+    // 1. Upload the photo (once - a retry skips this if it already went up)
+    if (draft.file && !draft.uploadedPath) {
+      showMessage(msg, 'Preparing photo...');
+      const img = await shrinkImage(draft.file);
+      const path = `${token}/${draft.clientId}.${img.ext}`;
+      showMessage(msg, 'Uploading photo...');
+      const { error } = await sb.storage.from(BUCKET).upload(path, img.blob, { contentType: img.type, upsert: false });
+      if (error && !/already exists|Duplicate/i.test(error.message)) throw error;
+      draft.uploadedPath = path;
+    }
+    // 2. Record the claim (client id makes a repeated tap safe)
+    showMessage(msg, 'Submitting...');
+    const { error } = await sb.rpc('rider_submit', {
+      p_token: token, p_client_id: draft.clientId, p_bonus_code: current.code,
+      p_photo_path: draft.uploadedPath, p_note: $('#note').value,
+      p_taken_at: draft.file?.lastModified ? new Date(draft.file.lastModified).toISOString() : null,
+    });
+    if (error) throw error;
+    const code = current.code;
+    draft = null; current = null;
+    $('#claim-view').hidden = true;
+    await load();
+    showMessage($('#page-msg'), `Received: ${code}. It will show as approved once a scorer reviews it.`, 'ok');
+    window.scrollTo(0, 0);
+  } catch (e) {
+    showMessage(msg, errorText(e), 'error');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+window.addEventListener('online', () => showMessage($('#claim-msg'), 'Signal is back - you can submit now.', 'ok'));
+load();
+</script>
+</body>
+</html>

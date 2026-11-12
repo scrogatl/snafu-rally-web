@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Scorer Review</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<main id="app">
+  <p class="muted">Loading...</p>
+</main>
+<dialog id="zoom"><img alt="Claim photo"><form method="dialog"><button class="secondary">Close</button></form></dialog>
+
+<script type="module">
+import { sb, $, esc, fmtTime, errorText, showMessage, setupBanner, currentScorer, renderLogin,
+         navBar, wireSignOut, shrinkImage, newId, BUCKET } from './lib.js';
+setupBanner();
+
+const app = $('#app');
+let tab = 'pending';
+let bonuses = [];
+let timer = null;
+
+async function start() {
+  let who;
+  try { who = await currentScorer(); } catch (e) { app.innerHTML = `<div class="msg error">${esc(errorText(e))}</div>`; return; }
+  if (!who.session) { renderLogin(app, start); return; }
+  if (!who.isScorer) {
+    app.innerHTML = `${navBar('scorer.html')}<div class="msg error">${esc(who.session.user.email)} is not on the scorer list.
+      Ask the organizer to add it.</div>`;
+    wireSignOut();
+    return;
+  }
+  app.innerHTML = `${navBar('scorer.html')}
+    <h1>Review claims</h1>
+    <div class="tabs">
+      <button type="button" data-tab="pending">Pending <span id="pending-count"></span></button>
+      <button type="button" data-tab="decided">Decided</button>
+      <button type="button" data-tab="add">Add claim</button>
+    </div>
+    <div class="row"><input type="search" id="filter" class="grow" placeholder="Filter by rider number or bonus code">
+      <button type="button" class="secondary" id="refresh">Refresh</button></div>
+    <div id="msg" class="msg" hidden></div>
+    <div id="body"></div>`;
+  wireSignOut();
+  app.querySelectorAll('[data-tab]').forEach((b) => b.addEventListener('click', () => { tab = b.dataset.tab; render(); }));
+  $('#refresh').addEventListener('click', render);
+  $('#filter').addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(render, 300); });
+  const { data } = await sb.from('bonuses').select('code,name,points').order('code');
+  bonuses = data || [];
+  render();
+  setInterval(() => { if (!document.hidden && tab === 'pending') render(); }, 20000);
+}
+
+function applyFilter(q) {
+  const f = $('#filter').value.trim().toUpperCase();
+  if (!f) return q;
+  if (/^\d+$/.test(f)) return q.eq('rider_number', Number(f));
+  return q.ilike('bonus_code', `${f}%`);
+}
+
+async function signedUrls(rows) {
+  const paths = rows.map((r) => r.photo_path).filter(Boolean);
+  if (!paths.length) return {};
+  const { data } = await sb.storage.from(BUCKET).createSignedUrls(paths, 3600);
+  return Object.fromEntries((data || []).map((d) => [d.path, d.signedUrl]));
+}
+
+async function render() {
+  app.querySelectorAll('[data-tab]').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  const { count } = await sb.from('claims').select('id', { count: 'exact', head: true }).eq('status', 'pending');
+  $('#pending-count').textContent = count != null ? `(${count})` : '';
+  $('#filter').parentElement.hidden = tab === 'add';
+  if (tab === 'add') return renderAdd();
+
+  let q = sb.from('claims_detail').select('*');
+  q = tab === 'pending'
+    ? q.eq('status', 'pending').order('submitted_at', { ascending: true })
+    : q.neq('status', 'pending').order('decided_at', { ascending: false }).limit(100);
+  const { data, error } = await applyFilter(q);
+  if (error) { showMessage($('#msg'), errorText(error), 'error'); return; }
+  showMessage($('#msg'), '');
+  const urls = await signedUrls(data);
+  $('#body').innerHTML = data.length ? data.map((c) => claimCard(c, urls[c.photo_path])).join('')
+    : `<p class="muted">${tab === 'pending' ? 'Nothing waiting. Nice.' : 'No decisions yet.'}</p>`;
+}
+
+function claimCard(c, url) {
+  const photo = url
+    ? `<img src="${esc(url)}" data-zoom="${esc(url)}" alt="Photo for ${esc(c.bonus_code)}">`
+    : `<div class="nophoto">${c.bonus_is_combo ? 'Combo - no photo needed' : 'No photo'}</div>`;
+  const decided = c.status !== 'pending'
+    ? `<p><span class="badge ${c.status}">${c.status}</span> by ${esc(c.decided_by)} at ${esc(fmtTime(c.decided_at))}
+       ${c.reason ? `<br><span class="muted">Reason: ${esc(c.reason)}</span>` : ''}</p>` : '';
+  const actions = c.status === 'pending'
+    ? `<div class="row">
+         <button type="button" class="ok" data-act="approved" data-id="${c.id}">Approve</button>
+         <input type="text" class="grow" placeholder="Reason (needed to deny)" data-reason="${c.id}" maxlength="500">
+         <button type="button" class="danger" data-act="denied" data-id="${c.id}">Deny</button>
+       </div>`
+    : `<button type="button" class="secondary" data-act="pending" data-id="${c.id}">Revert to pending</button>`;
+  return `<div class="card claim">
+    ${photo}
+    <div class="stack">
+      <div><h2><span class="bonus-code">${esc(c.bonus_code)}</span> ${esc(c.bonus_name || '')}
+        <span class="muted">${esc(c.points)} pts${c.bonus_is_combo ? ' - combo' : ''}</span></h2>
+        <p>Rider <strong>${esc(c.rider_number)}</strong> - ${esc(c.rider_name)}</p>
+        <p class="muted">Submitted ${esc(fmtTime(c.submitted_at))} by ${esc(c.submitted_by)}
+          ${c.taken_at ? `- photo file time ${esc(fmtTime(c.taken_at))}` : ''}</p>
+        ${c.note ? `<p>Note: ${esc(c.note)}</p>` : ''}
+        ${decided}</div>
+      ${actions}
+    </div></div>`;
+}
+
+document.addEventListener('click', async (ev) => {
+  const z = ev.target.closest('[data-zoom]');
+  if (z) { const d = $('#zoom'); $('img', d).src = z.dataset.zoom; d.showModal(); return; }
+  const b = ev.target.closest('[data-act]');
+  if (!b) return;
+  const status = b.dataset.act;
+  const reasonEl = document.querySelector(`[data-reason="${b.dataset.id}"]`);
+  const reason = reasonEl ? reasonEl.value.trim() : '';
+  if (status === 'denied' && !reason) { reasonEl.focus(); showMessage($('#msg'), 'Enter a reason to deny.', 'warn'); return; }
+  b.disabled = true;
+  const { error } = await sb.rpc('scorer_decide', { p_claim_id: b.dataset.id, p_status: status, p_reason: reason || null });
+  if (error) { showMessage($('#msg'), errorText(error), 'error'); b.disabled = false; return; }
+  render();
+});
+
+function renderAdd() {
+  $('#body').innerHTML = `<div class="card">
+    <h2>Add a claim for a rider</h2>
+    <p class="muted">For riders who could not submit themselves, penalties, or checkpoint entries.</p>
+    <form id="add-form" class="stack">
+      <div class="row">
+        <input type="number" id="a-rider" class="grow" placeholder="Rider number" required min="1">
+        <select id="a-bonus" class="grow" required>
+          <option value="">Bonus...</option>
+          ${bonuses.map((b) => `<option value="${esc(b.code)}">${esc(b.code)} - ${esc(b.name || '')} (${esc(b.points)})</option>`).join('')}
+        </select>
+      </div>
+      <select id="a-status"><option value="approved">Approve now</option><option value="pending">Add as pending</option></select>
+      <input type="text" id="a-note" placeholder="Note (optional)" maxlength="500">
+      <input type="file" id="a-photo" accept="image/*">
+      <button type="submit">Add claim</button>
+    </form>
+    <div id="a-msg" class="msg" hidden></div></div>`;
+  $('#add-form').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const m = $('#a-msg');
+    try {
+      let path = null;
+      const f = $('#a-photo').files[0];
+      if (f) {
+        const img = await shrinkImage(f);
+        path = `scorer/${newId()}.${img.ext}`;
+        const { error } = await sb.storage.from(BUCKET).upload(path, img.blob, { contentType: img.type });
+        if (error) throw error;
+      }
+      const { error } = await sb.rpc('scorer_add_claim', {
+        p_rider_number: Number($('#a-rider').value), p_bonus_code: $('#a-bonus').value,
+        p_status: $('#a-status').value, p_note: $('#a-note').value || null, p_photo_path: path,
+      });
+      if (error) throw error;
+      showMessage(m, `Added ${$('#a-bonus').value} for rider ${$('#a-rider').value}.`, 'ok');
+      ev.target.reset();
+    } catch (e) { showMessage(m, errorText(e), 'error'); }
+  });
+}
+
+start();
+</script>
+</body>
+</html>

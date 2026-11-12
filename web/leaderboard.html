@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Leader Board</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<main>
+  <h1>Leader board</h1>
+  <p class="muted" id="updated">Loading...</p>
+  <div id="msg" class="msg" hidden></div>
+  <div class="card table-wrap">
+    <table class="big-board">
+      <thead><tr><th>Finish</th><th>Rider</th><th>Name</th><th class="num">Bonuses</th><th class="num">Score</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+</main>
+<script type="module">
+import { sb, $, esc, errorText, showMessage, setupBanner } from './lib.js';
+setupBanner();
+
+async function load() {
+  const { data, error } = await sb.rpc('leaderboard');
+  if (error) { showMessage($('#msg'), errorText(error), 'error'); return; }
+  showMessage($('#msg'), '');
+  $('#rows').innerHTML = data.map((r) => `<tr>
+    <td>${esc(r.finish)}</td><td>${esc(r.rider_number)}</td><td>${esc(r.name)}</td>
+    <td class="num">${esc(r.bonuses_counted)}</td><td class="num"><strong>${esc(Number(r.score))}</strong></td></tr>`).join('');
+  $('#updated').textContent = `Updated ${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })} - refreshes every 30 seconds`;
+}
+load();
+setInterval(() => { if (!document.hidden) load(); }, 30000);
+</script>
+</body>
+</html>
