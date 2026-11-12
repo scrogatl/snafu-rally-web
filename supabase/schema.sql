@@ -247,19 +247,25 @@ create or replace view claims_detail with (security_invoker = true) as
 -- ---------------------------------------------------------------------------
 create or replace function rider_session(p_token uuid) returns json
 language plpgsql stable security definer set search_path = public as $$
-declare r riders; s settings;
+declare r riders; s settings; sc rider_scores;
 begin
   r := rider_from_token(p_token);
   select * into s from settings where id = 1;
+  select * into sc from rider_scores where rider_id = r.id;
   return json_build_object(
     'event_name',   s.event_name,
     'claims_open',  s.claims_open,
     'max_attempts', s.max_attempts,
     'rider',        json_build_object('number', r.rider_number, 'name', r.name),
+    -- Official score, same numbers as the leader board (approved only, penalties applied)
+    'score',        json_build_object('total', coalesce(sc.score, 0), 'base_points', coalesce(sc.base_points, 0),
+                                      'worst_penalty', sc.worst_penalty, 'bonuses_counted', coalesce(sc.bonuses_counted, 0)),
     'bonuses', coalesce((
       select json_agg(json_build_object(
                'code', b.code, 'name', b.name, 'points', b.points,
                'description', b.description, 'is_combo', is_combo(b.code),
+               -- true when this bonus counts toward the score (approved, or a combo with every part approved)
+               'counted', exists (select 1 from approved_effective e where e.rider_id = r.id and e.bonus_code = b.code),
                'attempts', (select count(*) from claims c where c.rider_id = r.id and c.bonus_code = b.code),
                'status', (select case
                                    when bool_or(c.status = 'approved') then 'approved'

@@ -78,3 +78,10 @@ th { color: var(--muted); font-weight: 600; }
 .big-board td { font-size: 1.1rem; padding: 12px 6px; }
 dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--text); padding: 8px; max-width: 96vw; }
 dialog img { max-width: 92vw; max-height: 85vh; display: block; }
+.score-card { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.score-total { font-size: 2rem; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.score-card p { margin: 0; }
+.tabs .count { font-weight: 400; opacity: 0.85; }
+.check { display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; }
+.check input { min-height: 0; width: 22px; height: 22px; }
+.list li.group-head { border-bottom: none; padding: 14px 4px 4px; font-weight: 700; color: var(--muted); font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.03em; }

@@ -12,11 +12,23 @@
     <h1 id="event-name">Rally Bonuses</h1>
     <p class="muted" id="rider-line">Loading...</p>
   </header>
+  <div id="score-card" class="card score-card" hidden>
+    <div class="score-total"><span id="score-total">0</span> <span class="muted">pts</span></div>
+    <p class="muted" id="score-line"></p>
+  </div>
   <div id="page-msg" class="msg" hidden></div>
 
   <!-- Bonus list -->
   <section id="list-view" hidden>
     <div class="card">
+      <div class="tabs" id="filter-tabs" role="tablist">
+        <button type="button" data-filter="todo" role="tab">To get <span class="count" id="n-todo"></span></button>
+        <button type="button" data-filter="claimed" role="tab">Claimed <span class="count" id="n-claimed"></span></button>
+        <button type="button" data-filter="all" role="tab">All <span class="count" id="n-all"></span></button>
+      </div>
+      <label class="check" id="group-wrap">
+        <input type="checkbox" id="group"> Group claimed bonuses together
+      </label>
       <input type="search" id="search" placeholder="Search bonus code or name" autocomplete="off">
       <ul class="list" id="bonus-list"></ul>
     </div>
@@ -71,6 +83,39 @@ const statusLabel = {
   denied: ['denied', 'Denied - you can try again'],
 };
 
+// List view choices, remembered on this phone
+const prefs = { filter: 'all', group: true };
+try { Object.assign(prefs, JSON.parse(localStorage.getItem('rally_list_prefs') || '{}')); } catch (e) { /* ignore */ }
+const savePrefs = () => { try { localStorage.setItem('rally_list_prefs', JSON.stringify(prefs)); } catch (e) { /* ignore */ } };
+
+const outOfAttempts = (b) => b.attempts >= session.max_attempts;
+
+// Label shown on a bonus. A combo whose parts are all approved counts without its own claim.
+function badgeFor(b) {
+  if (b.status === 'approved') return statusLabel.approved;
+  if (b.counted) return ['approved', 'Counted - all parts approved'];
+  if (b.status === 'pending') return statusLabel.pending;
+  if (b.status === 'denied') return outOfAttempts(b) ? ['denied', 'Denied - no attempts left'] : statusLabel.denied;
+  return ['', ''];
+}
+
+// "Claimed" = nothing more to do: approved, counted, waiting for review, or out of attempts.
+// A denied bonus with attempts left is still "to get", since the rider can try again.
+const isClaimed = (b) => b.counted || b.status === 'approved' || b.status === 'pending' ||
+  (b.status === 'denied' && outOfAttempts(b));
+
+function renderScore() {
+  const s = session.score;
+  if (!s) { $('#score-card').hidden = true; return; }   // database not updated to this page version yet
+  const pending = session.bonuses.filter((b) => b.status === 'pending' && !b.counted).length;
+  $('#score-total').textContent = Number(s.total).toLocaleString();
+  const parts = [`${s.bonuses_counted} bonus${s.bonuses_counted === 1 ? '' : 'es'} approved`];
+  if (pending) parts.push(`${pending} waiting for review`);
+  if (s.worst_penalty) parts.push(`includes a ${s.worst_penalty}% penalty`);
+  $('#score-line').textContent = parts.join(' - ');
+  $('#score-card').hidden = false;
+}
+
 async function load() {
   if (!token) {
     showMessage($('#page-msg'), 'Open this page from your personal rider link.', 'error');
@@ -89,23 +134,57 @@ async function load() {
   $('#rider-line').textContent = `Rider ${data.rider.number} - ${data.rider.name}`;
   if (!data.claims_open) showMessage($('#page-msg'), 'Claims are closed.', 'warn');
   else showMessage($('#page-msg'), '');
+  renderScore();
   renderList();
   if (current) openClaim(current.code, true);
   else $('#list-view').hidden = false;
 }
 
+function bonusItem(b) {
+  const [cls, label] = badgeFor(b);
+  return `<li><button type="button" class="bonus-btn" data-code="${esc(b.code)}">
+    <span><span class="bonus-code">${esc(b.code)}</span> ${esc(b.name || '')}
+      <br><span class="muted">${esc(b.points)} pts${b.is_combo ? ' - combo' : ''}</span></span>
+    ${label ? `<span class="badge ${cls}">${label}</span>` : ''}
+  </button></li>`;
+}
+const groupHeading = (text, n) => `<li class="group-head">${esc(text)} (${n})</li>`;
+
 function renderList() {
+  const all = session.bonuses;
+  const claimed = all.filter(isClaimed);
+  const todo = all.filter((b) => !isClaimed(b));
+  $('#n-todo').textContent = todo.length;
+  $('#n-claimed').textContent = claimed.length;
+  $('#n-all').textContent = all.length;
+  for (const t of document.querySelectorAll('#filter-tabs [data-filter]')) {
+    const on = t.dataset.filter === prefs.filter;
+    t.classList.toggle('active', on);
+    t.setAttribute('aria-selected', on);
+  }
+  $('#group-wrap').hidden = prefs.filter !== 'all';
+  $('#group').checked = prefs.group;
+
   const q = $('#search').value.trim().toLowerCase();
-  const items = session.bonuses.filter((b) =>
-    !q || b.code.toLowerCase().includes(q) || (b.name || '').toLowerCase().includes(q));
-  $('#bonus-list').innerHTML = items.map((b) => {
-    const [cls, label] = statusLabel[b.status] || ['', ''];
-    return `<li><button type="button" class="bonus-btn" data-code="${esc(b.code)}">
-      <span><span class="bonus-code">${esc(b.code)}</span> ${esc(b.name || '')}
-        <br><span class="muted">${esc(b.points)} pts${b.is_combo ? ' - combo' : ''}</span></span>
-      ${label ? `<span class="badge ${cls}">${label}</span>` : ''}
-    </button></li>`;
-  }).join('') || '<li class="muted" style="padding:12px 4px">No bonuses match.</li>';
+  const match = (b) => !q || b.code.toLowerCase().includes(q) || (b.name || '').toLowerCase().includes(q);
+  const empty = (text) => `<li class="muted" style="padding:12px 4px">${text}</li>`;
+  let html;
+  if (prefs.filter === 'todo') {
+    const items = todo.filter(match);
+    html = items.map(bonusItem).join('') ||
+      empty(q ? 'No bonuses match.' : 'Nothing left to get - every bonus is claimed.');
+  } else if (prefs.filter === 'claimed') {
+    const items = claimed.filter(match);
+    html = items.map(bonusItem).join('') || empty(q ? 'No bonuses match.' : 'No bonuses claimed yet.');
+  } else if (prefs.group) {
+    const a = todo.filter(match), c = claimed.filter(match);
+    html = (a.length ? groupHeading('To get', a.length) + a.map(bonusItem).join('') : '') +
+           (c.length ? groupHeading('Claimed', c.length) + c.map(bonusItem).join('') : '');
+    html = html || empty('No bonuses match.');
+  } else {
+    html = all.filter(match).map(bonusItem).join('') || empty('No bonuses match.');
+  }
+  $('#bonus-list').innerHTML = html;
 }
 
 function openClaim(code, keepDraft = false) {
@@ -129,6 +208,7 @@ function openClaim(code, keepDraft = false) {
   let blocked = '';
   if (!session.claims_open) blocked = 'Claims are closed.';
   else if (current.status === 'approved') blocked = 'This bonus is already approved for you.';
+  else if (current.counted) blocked = 'This combo already counts: all of its bonuses are approved.';
   else if (current.attempts >= session.max_attempts) blocked = 'You have used all attempts for this bonus. See rally staff.';
   showMessage($('#c-blocked'), blocked, 'warn');
   $('#claim-form').hidden = !!blocked && !keepDraft;
@@ -139,6 +219,18 @@ function openClaim(code, keepDraft = false) {
 }
 
 $('#search').addEventListener('input', renderList);
+$('#filter-tabs').addEventListener('click', (ev) => {
+  const t = ev.target.closest('[data-filter]');
+  if (!t) return;
+  prefs.filter = t.dataset.filter; savePrefs(); renderList();
+});
+$('#group').addEventListener('change', () => { prefs.group = $('#group').checked; savePrefs(); renderList(); });
+
+// Scorers approve while the rider rides: refresh the score and list when the rider comes back
+// to the page (only from the list, so a half-filled claim is never disturbed).
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && session && !$('#list-view').hidden) load();
+});
 $('#bonus-list').addEventListener('click', (ev) => {
   const btn = ev.target.closest('[data-code]');
   if (btn) openClaim(btn.dataset.code);

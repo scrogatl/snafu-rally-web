@@ -153,6 +153,12 @@ test('scoring: combos auto-count and penalties scale the score', async () => {
   const wxyz = (await scorer((tx) => one(tx, `select * from scorer_add_claim(42, 'WXYZ', 'approved', 'entered at checkpoint')`)));
   assert.equal(wxyz.status, 'approved');
   assert.equal(await score(), 175); // 100 + 50 + ARSN combo 25, without approving ARSN's own claim
+  const before = (await rider((tx) => one(tx, 'select rider_session($1) as s', [token42]))).s;
+  const arsnRow = before.bonuses.find((b) => b.code === 'ARSN');
+  assert.equal(arsnRow.counted, true, 'combo counts once all parts are approved');
+  assert.notEqual(arsnRow.status, 'approved', 'its own claim is still not approved');
+  assert.equal(before.bonuses.find((b) => b.code === 'ABC1').counted, false);
+  assert.equal(Number(before.score.total), 175);
 
   // approving the combo's own claim too must not double count
   const arsn = (await db.query(`select id from claims where bonus_code = 'ARSN'`)).rows[0].id;
@@ -170,6 +176,14 @@ test('scoring: combos auto-count and penalties scale the score', async () => {
   const s = (await rider((tx) => one(tx, 'select rider_session($1) as s', [token42]))).s;
   assert.equal(s.bonuses.find((b) => b.code === 'ABCD').status, 'approved');
   assert.equal(s.bonuses.find((b) => b.code === 'ABC1').status, 'pending');
+  // Rider sees the same score as the leader board, penalty included
+  assert.equal(Number(s.score.total), 131.25);
+  assert.equal(Number(s.score.total), Number(board[0].score));
+  assert.equal(s.score.worst_penalty, -25);
+  assert.equal(s.score.bonuses_counted, 3);
+  // Rider 7 has nothing yet
+  const s7 = (await rider((tx) => one(tx, 'select rider_session($1) as s', [token7]))).s;
+  assert.deepEqual([Number(s7.score.total), s7.score.worst_penalty, s7.score.bonuses_counted], [0, null, 0]);
 });
 
 test('closing claims and scorer reset', async () => {

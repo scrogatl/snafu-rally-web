@@ -92,10 +92,25 @@ async function bigJpeg() {
 const session = () => ({
   event_name: 'SNAFU Test Rally', claims_open: true, max_attempts: 3,
   rider: { number: 42, name: 'Jane Smith' },
+  score: { total: 50, base_points: 50, worst_penalty: null, bonuses_counted: 1 },
   bonuses: [
-    { code: 'ABCD', name: 'Old mill', points: 100, description: 'Photo of the wheel', is_combo: false, attempts: 0, status: null },
-    { code: 'WXYZ', name: 'Covered bridge', points: 50, is_combo: false, attempts: 1, status: 'approved' },
-    { code: 'ARSN', name: 'Mill + bridge', points: 25, is_combo: true, attempts: 0, status: null },
+    { code: 'ABCD', name: 'Old mill', points: 100, description: 'Photo of the wheel', is_combo: false, attempts: 0, status: null, counted: false },
+    { code: 'WXYZ', name: 'Covered bridge', points: 50, is_combo: false, attempts: 1, status: 'approved', counted: true },
+    { code: 'ARSN', name: 'Mill + bridge', points: 25, is_combo: true, attempts: 0, status: null, counted: false },
+  ],
+});
+
+// One bonus in every state, for the score / grouping / filter test
+const busySession = () => ({
+  ...session(),
+  score: { total: 1234.5, base_points: 1371.67, worst_penalty: -10, bonuses_counted: 2 },
+  bonuses: [
+    { code: 'ABCD', name: 'Old mill', points: 100, is_combo: false, attempts: 0, status: null, counted: false },
+    { code: 'WXYZ', name: 'Covered bridge', points: 50, is_combo: false, attempts: 1, status: 'approved', counted: true },
+    { code: 'ARSN', name: 'Mill + bridge', points: 25, is_combo: true, attempts: 0, status: null, counted: true },
+    { code: 'PEND', name: 'Waiting one', points: 10, is_combo: false, attempts: 1, status: 'pending', counted: false },
+    { code: 'DENY', name: 'Denied once', points: 20, is_combo: false, attempts: 1, status: 'denied', counted: false },
+    { code: 'DEAD', name: 'Out of tries', points: 30, is_combo: false, attempts: 3, status: 'denied', counted: false },
   ],
 });
 
@@ -112,7 +127,7 @@ test('rider: submit with photo, survives a dropped connection without re-uploadi
   });
   await page.goto(`${APP}rider.html?t=${TOKEN}`);
   await page.getByText('Rider 42 - Jane Smith').waitFor();
-  assert.ok(await page.getByText('Approved').isVisible());
+  assert.ok(await page.locator('.badge.approved', { hasText: 'Approved' }).isVisible());
 
   if (process.env.SHOTS) { await page.setViewportSize({ width: 390, height: 760 }); await page.screenshot({ path: 'tmp/rider-list.png' }); }
   await page.getByRole('button', { name: /ABCD/ }).click();
@@ -163,6 +178,57 @@ test('rider: combo can be sent without a photo; approved bonus is blocked; bad l
   });
   await bad.page.goto(`${APP}rider.html?t=${TOKEN}`);
   await bad.page.getByText('This rider link is not valid').waitFor();
+});
+
+test('rider: score at the top; claimed bonuses grouped, filtered and remembered', async () => {
+  const { page, errors } = await newPage({
+    'POST /rest/v1/rpc/rider_session': () => ({ json: busySession() }),
+  });
+  const codes = () => page.$$eval('#bonus-list [data-code]', (els) => els.map((e) => e.dataset.code));
+  const heads = () => page.$$eval('#bonus-list .group-head', (els) => els.map((e) => e.textContent));
+
+  await page.goto(`${APP}rider.html?t=${TOKEN}`);
+  await page.getByText('Rider 42 - Jane Smith').waitFor();
+  assert.equal(await page.textContent('#score-total'), (1234.5).toLocaleString('en-US'));
+  assert.equal(await page.textContent('#score-line'),
+    '2 bonuses approved - 1 waiting for review - includes a -10% penalty');
+
+  // Default: all, grouped. Denied with tries left is still "to get"; out of tries is claimed.
+  assert.deepEqual(await heads(), ['To get (2)', 'Claimed (4)']);
+  assert.deepEqual(await codes(), ['ABCD', 'DENY', 'WXYZ', 'ARSN', 'PEND', 'DEAD']);
+  assert.equal(await page.textContent('#n-todo'), '2');
+  assert.equal(await page.textContent('#n-claimed'), '4');
+  assert.ok(await page.getByText('Counted - all parts approved').isVisible());
+  assert.ok(await page.getByText('Denied - no attempts left').isVisible());
+  if (process.env.SHOTS) { await page.setViewportSize({ width: 390, height: 860 }); await page.screenshot({ path: 'tmp/rider-grouped.png' }); }
+
+  // Ungrouped keeps the event's own order
+  await page.getByLabel('Group claimed bonuses together').uncheck();
+  assert.deepEqual(await heads(), []);
+  assert.deepEqual(await codes(), ['ABCD', 'WXYZ', 'ARSN', 'PEND', 'DENY', 'DEAD']);
+
+  // "To get" skips everything already claimed; search works inside it
+  await page.getByRole('tab', { name: /To get/ }).click();
+  assert.deepEqual(await codes(), ['ABCD', 'DENY']);
+  assert.equal(await page.isVisible('#group-wrap'), false);
+  await page.fill('#search', 'mill');
+  assert.deepEqual(await codes(), ['ABCD']);
+  await page.fill('#search', '');
+
+  await page.getByRole('tab', { name: /Claimed/ }).click();
+  assert.deepEqual(await codes(), ['WXYZ', 'ARSN', 'PEND', 'DEAD']);
+
+  // Choice is remembered on the phone
+  await page.reload();
+  await page.getByText('Rider 42 - Jane Smith').waitFor();
+  assert.equal(await page.getAttribute('#filter-tabs [data-filter="claimed"]', 'aria-selected'), 'true');
+  assert.deepEqual(await codes(), ['WXYZ', 'ARSN', 'PEND', 'DEAD']);
+
+  // A combo that already counts cannot be sent again
+  await page.getByRole('button', { name: /ARSN/ }).click();
+  await page.getByText('This combo already counts').waitFor();
+  assert.equal(await page.isVisible('#claim-form'), false);
+  assert.deepEqual(errors, []);
 });
 
 test('scorer: sees pending claim with photo, deny needs a reason, approve calls the API', async () => {
