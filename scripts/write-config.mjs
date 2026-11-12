@@ -7,20 +7,34 @@
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-const url = (process.env.SUPABASE_URL || '').trim();
+const rawUrl = (process.env.SUPABASE_URL || '').trim();
 const key = (process.env.SUPABASE_ANON_KEY || '').trim();
 
 const missing = [];
-if (!url) missing.push('SUPABASE_URL');
+if (!rawUrl) missing.push('SUPABASE_URL');
 if (!key) missing.push('SUPABASE_ANON_KEY');
 if (missing.length) {
   console.error(`Missing environment variable(s): ${missing.join(', ')}. Set them in Netlify -> Site configuration -> Environment variables.`);
   process.exit(1);
 }
-if (!/^https?:\/\/[^\s'"]+$/.test(url)) {
-  console.error('SUPABASE_URL does not look like a URL.');
+
+// supabase-js adds /rest/v1, /auth/v1 and /storage/v1 itself, so it needs the bare project
+// address. Anything after the host (like a pasted /rest/v1/) breaks every call with
+// "Invalid path specified in request URL", so keep only scheme + host.
+const HINT = 'Use the Project URL from Supabase -> Project Settings -> API, like https://abcd1234.supabase.co';
+let parsed;
+try { parsed = new URL(rawUrl); } catch { parsed = null; }
+if (!parsed || !['https:', 'http:'].includes(parsed.protocol)) {
+  // Do not echo the value: a pasted postgresql:// connection string contains the database password
+  console.error(`SUPABASE_URL is not a web address (it should start with https://). ${HINT}`);
   process.exit(1);
 }
+if (/(^|\.)supabase\.com$/.test(parsed.hostname)) {
+  console.error(`SUPABASE_URL is a Supabase dashboard address, not the project API. ${HINT}`);
+  process.exit(1);
+}
+const url = parsed.origin;
+if (url !== rawUrl) console.warn(`Note: SUPABASE_URL trimmed from "${rawUrl}" to "${url}".`);
 if (/[\s'"\\]/.test(key)) {
   console.error('SUPABASE_ANON_KEY contains spaces, quotes or backslashes.');
   process.exit(1);
