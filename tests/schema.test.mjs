@@ -48,7 +48,7 @@ test('bonus code format is enforced', async () => {
 });
 
 test('anon key alone cannot read tables', async () => {
-  for (const t of ['riders', 'claims', 'rider_scores', 'bonuses', 'settings', 'scorers']) {
+  for (const t of ['riders', 'claims', 'rider_scores', 'bonuses', 'settings', 'scorers', 'claim_activity', 'rider_activity']) {
     await rejects(rider((tx) => tx.query(`select * from ${t}`)), /permission denied/);
   }
 });
@@ -184,6 +184,51 @@ test('scoring: combos auto-count and penalties scale the score', async () => {
   // Rider 7 has nothing yet
   const s7 = (await rider((tx) => one(tx, 'select rider_session($1) as s', [token7]))).s;
   assert.deepEqual([Number(s7.score.total), s7.score.worst_penalty, s7.score.bonuses_counted], [0, null, 0]);
+});
+
+test('activity: rider last seen, claim feed, rider summary, scorer sign-ins', async () => {
+  const seen = async (n) => (await db.query('select last_seen_at from riders where rider_number = $1', [n])).rows[0].last_seen_at;
+  const openPage = (token) => rider((tx) => tx.query('select rider_session($1)', [token]));
+
+  // Opening the page records the visit, at most once a minute
+  await db.query(`update riders set last_seen_at = now() - interval '2 minutes' where rider_number = 42`);
+  const old = await seen(42);
+  await openPage(token42);
+  const fresh = await seen(42);
+  assert.ok(fresh > old, 'stale last_seen_at is updated');
+  await openPage(token42);
+  assert.equal((await seen(42)).getTime(), fresh.getTime(), 'not rewritten within a minute');
+
+  // Never-opened link shows as null
+  await db.query('update riders set last_seen_at = null where rider_number = 7');
+  const ra = (await scorer((tx) => tx.query('select * from rider_activity order by rider_number'))).rows;
+  const r7 = ra.find((r) => r.rider_number === 7), r42 = ra.find((r) => r.rider_number === 42);
+  assert.equal(r7.last_seen_at, null);
+  assert.equal(Number(r7.claims), 0);
+  assert.ok(Number(r42.claims) >= 4);
+  assert.equal(Number(r42.approved), 4); // ABCD, WXYZ, ARSN, LAT1
+  assert.ok(Number(r42.pending) >= 1);   // ABC1
+  assert.equal(Number(r42.score), 131.25);
+  assert.ok(r42.last_claim_at);
+
+  // Feed: rider submissions and scorer decisions, newest first, with rider and bonus filled in
+  const feed = (await scorer((tx) => tx.query('select * from claim_activity order by at desc, id desc'))).rows;
+  assert.ok(feed.some((e) => e.action === 'submitted' && e.actor === 'rider 42' && e.bonus_code === 'ABCD'));
+  assert.ok(feed.some((e) => e.action === 'approved' && e.actor === SCORER && e.rider_number === 42));
+  assert.ok(feed.every((e) => e.rider_name && e.bonus_code));
+
+  // Non-scorers see nothing; anon cannot read at all
+  const stranger = (fn) => as('authenticated', 'random@example.com', fn);
+  assert.equal((await stranger((tx) => tx.query('select * from claim_activity'))).rows.length, 0);
+  assert.equal((await stranger((tx) => tx.query('select * from rider_activity'))).rows.length, 0);
+
+  // Scorer list with last sign-in from Supabase Auth
+  await db.query(`insert into auth.users (email, last_sign_in_at) values ($1, now())`, [SCORER.toUpperCase()]);
+  const list = (await scorer((tx) => tx.query('select * from scorer_list()'))).rows;
+  assert.deepEqual(list.map((r) => r.email), [SCORER]);
+  assert.ok(list[0].last_sign_in_at, 'matched case-insensitively');
+  await rejects(stranger((tx) => tx.query('select * from scorer_list()')), /Not authorized/);
+  await rejects(rider((tx) => tx.query('select * from scorer_list()')), /permission denied/);
 });
 
 test('closing claims and scorer reset', async () => {

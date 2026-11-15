@@ -14,13 +14,15 @@
 
 <script type="module">
 import { sb, $, esc, fmtTime, errorText, showMessage, setupBanner, currentScorer, renderLogin,
-         navBar, wireSignOut, shrinkImage, newId, BUCKET } from './lib.js';
+         navBar, wireSignOut, shrinkImage, newId, BUCKET, sortableTable, remember, keep } from './lib.js';
 setupBanner();
 
 const app = $('#app');
 let tab = 'pending';
+let view = remember('review_view', 'cards');   // 'cards' or 'table', remembered on this device
 let bonuses = [];
 let timer = null;
+let tables = {};   // sortable tables for the Table view, one per tab
 
 async function start() {
   let who;
@@ -40,17 +42,68 @@ async function start() {
       <button type="button" data-tab="add">Add claim</button>
     </div>
     <div class="row"><input type="search" id="filter" class="grow" placeholder="Filter by rider number or bonus code">
+      <div class="tabs view-switch" id="view-switch">
+        <button type="button" data-view="cards">Cards</button>
+        <button type="button" data-view="table">Table</button>
+      </div>
       <button type="button" class="secondary" id="refresh">Refresh</button></div>
     <div id="msg" class="msg" hidden></div>
-    <div id="body"></div>`;
+    <div id="body"></div>
+    <div id="table-pending" hidden></div>
+    <div id="table-decided" hidden></div>`;
   wireSignOut();
+  makeTables();
   app.querySelectorAll('[data-tab]').forEach((b) => b.addEventListener('click', () => { tab = b.dataset.tab; render(); }));
+  app.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => {
+    view = b.dataset.view; keep('review_view', view); render();
+  }));
   $('#refresh').addEventListener('click', render);
   $('#filter').addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(render, 300); });
   const { data } = await sb.from('bonuses').select('code,name,points').order('code');
   bonuses = data || [];
   render();
-  setInterval(() => { if (!document.hidden && tab === 'pending') render(); }, 20000);
+  // Auto-refresh the queue, but never while a scorer is typing a deny reason (a redraw would wipe it)
+  setInterval(() => { if (!document.hidden && tab === 'pending' && !typingReason()) render(); }, 20000);
+}
+
+const typingReason = () => [...document.querySelectorAll('[data-reason]')]
+  .some((el) => el.value.trim() || el === document.activeElement);
+
+// Table view: one dense row per claim, sortable by any header. Uses the same data-act / data-reason /
+// data-zoom attributes as the cards, so Approve, Deny, Revert and photo zoom work the same way.
+function makeTables() {
+  const time = (k) => ({ value: (r) => (r[k] ? new Date(r[k]).getTime() : null), cell: (r) => esc(fmtTime(r[k])) });
+  const photo = { key: 'photo', label: 'Photo', nosort: true, cell: (r) => (r.url
+    ? `<img class="thumb" src="${esc(r.url)}" data-zoom="${esc(r.url)}" alt="Photo for ${esc(r.bonus_code)}">`
+    : `<span class="muted">${r.bonus_is_combo ? 'combo' : 'none'}</span>`) };
+  const rider = { key: 'rider_number', label: 'Rider', num: true };
+  const name = { key: 'rider_name', label: 'Name' };
+  const bonus = { key: 'bonus_code', label: 'Bonus',
+    cell: (r) => `<span class="bonus-code">${esc(r.bonus_code)}</span> ${esc(r.bonus_name || '')}${r.bonus_is_combo ? ' <span class="muted">(combo)</span>' : ''}` };
+  const points = { key: 'points', label: 'Points', num: true, desc: true };
+  tables.pending = sortableTable($('#table-pending'), [
+    photo,
+    { key: 'submitted_at', label: 'Submitted', ...time('submitted_at') },
+    rider, name, bonus, points,
+    { key: 'submitted_by', label: 'By' },
+    { key: 'taken_at', label: 'Photo time', ...time('taken_at') },
+    { key: 'note', label: 'Note', cls: 'wrap' },
+    { key: 'actions', label: 'Decide', nosort: true, cell: (r) => `<div class="row-actions">
+        <button type="button" class="ok" data-act="approved" data-id="${esc(r.id)}">Approve</button>
+        <input type="text" placeholder="Reason to deny" data-reason="${esc(r.id)}" maxlength="500" aria-label="Reason to deny ${esc(r.bonus_code)} for rider ${esc(r.rider_number)}">
+        <button type="button" class="danger" data-act="denied" data-id="${esc(r.id)}">Deny</button></div>` },
+  ], { sort: { key: 'submitted_at', dir: 'asc' }, store: 'review_sort_pending', empty: 'Nothing waiting. Nice.' });
+  tables.decided = sortableTable($('#table-decided'), [
+    photo,
+    { key: 'decided_at', label: 'Decided', desc: true, ...time('decided_at') },
+    { key: 'status', label: 'Status', cell: (r) => `<span class="badge ${esc(r.status)}">${esc(r.status)}</span>` },
+    rider, name, bonus, points,
+    { key: 'decided_by', label: 'Decided by' },
+    { key: 'reason', label: 'Reason', cls: 'wrap' },
+    { key: 'submitted_at', label: 'Submitted', ...time('submitted_at') },
+    { key: 'actions', label: '', nosort: true, cell: (r) => `<div class="row-actions">
+        <button type="button" class="secondary" data-act="pending" data-id="${esc(r.id)}">Revert</button></div>` },
+  ], { sort: { key: 'decided_at', dir: 'desc' }, store: 'review_sort_decided', empty: 'No decisions yet.' });
 }
 
 function applyFilter(q) {
@@ -69,10 +122,18 @@ async function signedUrls(rows) {
 
 async function render() {
   app.querySelectorAll('[data-tab]').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  app.querySelectorAll('[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
   const { count } = await sb.from('claims').select('id', { count: 'exact', head: true }).eq('status', 'pending');
   $('#pending-count').textContent = count != null ? `(${count})` : '';
   $('#filter').parentElement.hidden = tab === 'add';
-  if (tab === 'add') return renderAdd();
+  const tableMode = view === 'table' && tab !== 'add';
+  // Shows the right container; called once the rows are ready so cards and table never show together
+  const showViews = () => {
+    app.classList.toggle('wide', tableMode);   // tables get the full screen width on a laptop
+    $('#table-pending').hidden = !(tableMode && tab === 'pending');
+    $('#table-decided').hidden = !(tableMode && tab === 'decided');
+  };
+  if (tab === 'add') { showViews(); return renderAdd(); }
 
   let q = sb.from('claims_detail').select('*');
   q = tab === 'pending'
@@ -82,6 +143,17 @@ async function render() {
   if (error) { showMessage($('#msg'), errorText(error), 'error'); return; }
   showMessage($('#msg'), '');
   const urls = await signedUrls(data);
+  if (tableMode) {
+    // Only one view holds the action inputs at a time, so data-reason lookups stay unique
+    $('#body').innerHTML = tab === 'decided' && data.length === 100
+      ? '<p class="muted">Showing the latest 100 decisions. Use the filter to find older ones.</p>' : '';
+    tables[tab === 'pending' ? 'decided' : 'pending'].set([]);
+    tables[tab].set(data.map((c) => ({ ...c, url: urls[c.photo_path] })));
+    showViews();
+    return;
+  }
+  tables.pending.set([]); tables.decided.set([]);
+  showViews();
   $('#body').innerHTML = data.length ? data.map((c) => claimCard(c, urls[c.photo_path])).join('')
     : `<p class="muted">${tab === 'pending' ? 'Nothing waiting. Nice.' : 'No decisions yet.'}</p>`;
 }

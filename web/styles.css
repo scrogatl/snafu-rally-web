@@ -85,3 +85,22 @@ dialog img { max-width: 92vw; max-height: 85vh; display: block; }
 .check { display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; }
 .check input { min-height: 0; width: 22px; height: 22px; }
 .list li.group-head { border-bottom: none; padding: 14px 4px 4px; font-weight: 700; color: var(--muted); font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.03em; }
+/* Dense sortable tables (Review table view, Activity) */
+table.data { font-size: 0.9rem; }
+table.data th, table.data td { padding: 6px 6px; white-space: nowrap; vertical-align: middle; }
+table.data td.wrap { white-space: normal; min-width: 160px; }
+table.data thead th { position: sticky; top: 0; background: var(--card); z-index: 1; }
+.th-sort { background: none; border: none; color: var(--muted); font-weight: 600; padding: 4px 0; min-height: 0; text-align: inherit; }
+th[aria-sort] .th-sort { color: var(--text); }
+th[aria-sort="ascending"] .th-sort::after { content: " \25B2"; font-size: 0.7em; }
+th[aria-sort="descending"] .th-sort::after { content: " \25BC"; font-size: 0.7em; }
+table.data img.thumb { width: 44px; height: 44px; object-fit: cover; border-radius: 6px; cursor: zoom-in; display: block; }
+table.data .row-actions { display: flex; gap: 6px; align-items: center; }
+table.data .row-actions input, table.data .row-actions button { min-height: 34px; padding: 4px 10px; font-size: 0.85rem; }
+table.data .row-actions input { width: 160px; }
+tr.attention td { background: var(--warn-bg); }
+.wide { max-width: 1280px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 12px 0; }
+.tile { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+.tile .n { font-size: 1.5rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.view-switch button { min-height: 40px; padding: 6px 12px; }

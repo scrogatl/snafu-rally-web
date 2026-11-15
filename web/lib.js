@@ -101,7 +101,8 @@ export function renderLogin(container, onDone) {
 }
 
 export function navBar(active) {
-  const links = [['scorer.html', 'Review'], ['admin.html', 'Admin'], ['leaderboard.html', 'Leader board']];
+  const links = [['scorer.html', 'Review'], ['activity.html', 'Activity'], ['admin.html', 'Admin'],
+    ['leaderboard.html', 'Leader board']];
   return `<nav class="nav">${links.map(([href, label]) =>
     `<a href="${href}" class="${active === href ? 'active' : ''}">${label}</a>`).join('')}
     <button type="button" class="link" id="sign-out">Sign out</button></nav>`;
@@ -110,4 +111,56 @@ export function navBar(active) {
 export function wireSignOut() {
   const b = document.getElementById('sign-out');
   if (b) b.addEventListener('click', async () => { await sb.auth.signOut(); location.reload(); });
+}
+
+// Read / write a small remembered choice; storage can be blocked (private mode), so never throw
+export function remember(key, fallback) {
+  try { const v = localStorage.getItem(key); return v === null ? fallback : JSON.parse(v); } catch (e) { return fallback; }
+}
+export function keep(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* ignore */ }
+}
+
+// Sortable table. Click a header to sort; click again to reverse. The choice is remembered.
+//   cols: [{ key, label, num (right-align), desc (first click sorts high-to-low),
+//            value(row) -> sort value (default row[key]), cell(row) -> HTML (default escaped value),
+//            cls (extra cell class, e.g. 'wrap'), nosort }]
+//   opts: { sort: { key, dir: 'asc' | 'desc' }, store: localStorage key, empty: text, rowClass(row) }
+// Empty values sort as the smallest, so ascending shows blanks (like "never seen") first.
+// Returns { set(rows) } to (re)draw with new rows.
+export function sortableTable(el, cols, opts = {}) {
+  let rows = [];
+  let sort = (opts.store && remember(opts.store, null)) || opts.sort || { key: cols[0].key, dir: 'asc' };
+  if (!cols.some((c) => c.key === sort.key)) sort = opts.sort || { key: cols[0].key, dir: 'asc' };
+  const valueOf = (c, r) => (c.value ? c.value(r) : r[c.key]);
+  const blank = (v) => v === null || v === undefined || v === '';
+  const cmp = (a, b) => {
+    if (blank(a) || blank(b)) return blank(a) && blank(b) ? 0 : blank(a) ? -1 : 1;
+    if (typeof a === 'number' && typeof b === 'number') return a - b;
+    return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
+  };
+  function draw() {
+    const col = cols.find((c) => c.key === sort.key);
+    const sorted = col ? rows.map((r, i) => [r, i]).sort(([a, i], [b, j]) =>
+      (cmp(valueOf(col, a), valueOf(col, b)) * (sort.dir === 'desc' ? -1 : 1)) || i - j).map(([r]) => r) : rows;
+    const head = cols.map((c) => {
+      const aria = c.key === sort.key ? ` aria-sort="${sort.dir === 'asc' ? 'ascending' : 'descending'}"` : '';
+      const label = c.nosort ? esc(c.label) : `<button type="button" class="th-sort" data-sort="${esc(c.key)}">${esc(c.label)}</button>`;
+      return `<th class="${c.num ? 'num' : ''}"${aria}>${label}</th>`;
+    }).join('');
+    const body = sorted.map((r) => `<tr class="${opts.rowClass ? esc(opts.rowClass(r) || '') : ''}">${cols.map((c) =>
+      `<td class="${c.num ? 'num' : ''} ${c.cls || ''}">${c.cell ? c.cell(r) : esc(valueOf(c, r))}</td>`).join('')}</tr>`).join('');
+    el.innerHTML = `<div class="table-wrap"><table class="data"><thead><tr>${head}</tr></thead><tbody>${
+      body || `<tr><td colspan="${cols.length}" class="muted">${esc(opts.empty || 'Nothing to show.')}</td></tr>`}</tbody></table></div>`;
+  }
+  el.addEventListener('click', (ev) => {
+    const b = ev.target.closest('[data-sort]');
+    if (!b || !el.contains(b)) return;
+    const col = cols.find((c) => c.key === b.dataset.sort);
+    sort = sort.key === col.key ? { key: col.key, dir: sort.dir === 'asc' ? 'desc' : 'asc' }
+      : { key: col.key, dir: col.desc ? 'desc' : 'asc' };
+    if (opts.store) keep(opts.store, sort);
+    draw();
+  });
+  return { set(r) { rows = r || []; draw(); } };
 }

@@ -10,7 +10,8 @@ Full design and rules: [SPEC.md](SPEC.md).
 | Page | Who | What |
 |---|---|---|
 | `rider.html?t=<token>` | Rider | Bonus list, score, photo submit. No login; the link is the key. |
-| `scorer.html` | Scorer | Approve / deny / revert claims, add a claim for a rider. |
+| `scorer.html` | Scorer | Approve / deny / revert claims as photo cards or a sortable table, add a claim for a rider. |
+| `activity.html` | Scorer | What is happening now: claim feed, which riders have opened their link, scorer sign-ins. |
 | `admin.html` | Scorer | Event settings, CSV import, rider links, testing reset. |
 | `leaderboard.html` | Anyone | Live ranking. |
 

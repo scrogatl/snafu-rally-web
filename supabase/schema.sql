@@ -41,6 +41,8 @@ create table if not exists riders (
   token         uuid not null unique default gen_random_uuid(),
   created_at    timestamptz not null default now()
 );
+-- When the rider last opened their page (set by rider_session). Null = link never opened.
+alter table riders add column if not exists last_seen_at timestamptz;
 
 create table if not exists bonuses (
   code          text primary key
@@ -243,13 +245,41 @@ create or replace view claims_detail with (security_invoker = true) as
   join bonuses b on b.code = c.bonus_code;
 
 -- ---------------------------------------------------------------------------
+-- Activity (scorer pages). Views run as the caller, so RLS limits them to scorers.
+-- ---------------------------------------------------------------------------
+-- Every claim event (rider submissions and scorer decisions), with rider and bonus
+create or replace view claim_activity with (security_invoker = true) as
+  select e.id, e.at, e.action, e.actor, e.from_status, e.to_status, e.reason, e.claim_id,
+         r.rider_number, r.name as rider_name, c.bonus_code, b.name as bonus_name, b.points
+  from claim_events e
+  join claims c on c.id = e.claim_id
+  join riders r on r.id = c.rider_id
+  join bonuses b on b.code = c.bonus_code;
+
+-- One row per rider: when they last opened their page, claim counts, score
+create or replace view rider_activity with (security_invoker = true) as
+  select r.rider_number, r.name, r.last_seen_at,
+         count(c.id)                                      as claims,
+         count(c.id) filter (where c.status = 'pending')  as pending,
+         count(c.id) filter (where c.status = 'approved') as approved,
+         count(c.id) filter (where c.status = 'denied')   as denied,
+         max(c.submitted_at)                              as last_claim_at,
+         coalesce((select s.score from rider_scores s where s.rider_id = r.id), 0) as score
+  from riders r
+  left join claims c on c.rider_id = r.id
+  group by r.id, r.rider_number, r.name, r.last_seen_at;
+
+-- ---------------------------------------------------------------------------
 -- Rider functions (anon key + token)
 -- ---------------------------------------------------------------------------
 create or replace function rider_session(p_token uuid) returns json
-language plpgsql stable security definer set search_path = public as $$
+language plpgsql volatile security definer set search_path = public as $$
 declare r riders; s settings; sc rider_scores;
 begin
   r := rider_from_token(p_token);
+  -- Record the visit for the activity page (at most once a minute per rider, to keep writes low)
+  update riders set last_seen_at = now()
+   where id = r.id and (last_seen_at is null or last_seen_at < now() - interval '1 minute');
   select * into s from settings where id = 1;
   select * into sc from rider_scores where rider_id = r.id;
   return json_build_object(
@@ -404,6 +434,16 @@ begin
   return t;
 end $$;
 
+-- Scorer list with last sign-in time from Supabase Auth (for the activity page)
+create or replace function scorer_list() returns table (email text, last_sign_in_at timestamptz)
+language plpgsql stable security definer set search_path = public as $$
+begin
+  perform require_scorer();
+  return query
+    select s.email, (select max(u.last_sign_in_at) from auth.users u where lower(u.email) = s.email)
+    from scorers s order by s.email;
+end $$;
+
 create or replace function scorer_delete_all_claims(p_confirm text) returns int
 language plpgsql volatile security definer set search_path = public as $$
 declare n int;
@@ -453,7 +493,8 @@ revoke all on all tables in schema public from anon, authenticated;
 revoke all on all sequences in schema public from anon, authenticated;
 grant select, insert, update, delete on settings, riders, bonuses, combo_members to authenticated;
 grant select on scorers, claims, claim_events to authenticated;
-grant select on approved_direct, approved_effective, rider_scores, claims_detail to authenticated;
+grant select on approved_direct, approved_effective, rider_scores, claims_detail,
+                claim_activity, rider_activity to authenticated;
 grant usage, select on sequence riders_id_seq to authenticated;   -- admin CSV import adds riders
 grant all on all tables in schema public to service_role;
 grant all on all sequences in schema public to service_role;
@@ -472,6 +513,7 @@ grant execute on function scorer_decide(uuid, claim_status, text)               
 grant execute on function scorer_add_claim(int, text, claim_status, text, text, text) to authenticated;
 grant execute on function scorer_new_token(int)                                     to authenticated;
 grant execute on function scorer_delete_all_claims(text)                            to authenticated;
+grant execute on function scorer_list()                                             to authenticated;
 grant execute on function require_scorer()                                          to authenticated;
 
 -- ---------------------------------------------------------------------------

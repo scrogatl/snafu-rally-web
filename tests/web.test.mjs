@@ -261,6 +261,101 @@ test('scorer: sees pending claim with photo, deny needs a reason, approve calls 
   assert.deepEqual(errors, []);
 });
 
+test('scorer: table view is sortable, decides from the row, and is remembered', async () => {
+  const now = Date.now();
+  const claim = (id, rider, code, points, minsAgo, extra = {}) => ({
+    id, status: 'pending', bonus_code: code, bonus_name: `Bonus ${code}`, points, bonus_is_combo: false,
+    rider_number: rider, rider_name: `Rider ${rider}`, submitted_at: new Date(now - minsAgo * 60000).toISOString(),
+    submitted_by: `rider ${rider}`, photo_path: `${TOKEN}/${id}.jpg`, ...extra });
+  const { page, calls, errors } = await newPage({
+    'POST /rest/v1/rpc/is_scorer': () => ({ json: true }),
+    'GET /rest/v1/bonuses': () => ({ json: [] }),
+    'HEAD /rest/v1/claims': () => ({ headers: { 'content-range': '0-2/3' } }),
+    'GET /rest/v1/claims_detail': () => ({ json: [
+      claim('c1', 42, 'ABCD', 100, 30), claim('c2', 7, 'WXYZ', 50, 10), claim('c3', 15, 'ABC1', 10, 20, { note: 'blurry sign' }),
+    ] }),
+    'POST /storage/v1/object/sign/claims': (c) => ({ json: c.json.paths.map((p) => ({ path: p, signedURL: `/object/sign/claims/${p}?token=t`, error: null })) }),
+    'POST /rest/v1/rpc/scorer_decide': () => ({ json: { id: 'c2', status: 'denied' } }),
+  }, { session: true });
+  const ids = () => page.$$eval('#table-pending tbody [data-act="approved"]', (els) => els.map((e) => e.dataset.id));
+
+  await page.goto(`${APP}scorer.html`);
+  await page.locator('.claim').first().waitFor();
+  await page.getByRole('button', { name: 'Table', exact: true }).click();
+  await page.locator('#table-pending [data-act="approved"]').first().waitFor();
+  assert.equal(await page.locator('.claim').count(), 0, 'cards are gone in table view');
+  assert.deepEqual(await ids(), ['c1', 'c3', 'c2'], 'oldest first by default');
+  assert.equal(await page.locator('#table-pending img.thumb').count(), 3);
+  assert.ok(await page.getByRole('cell', { name: 'blurry sign' }).isVisible());
+
+  await page.getByRole('button', { name: 'Points' }).click();     // first click: highest first
+  assert.deepEqual(await ids(), ['c1', 'c2', 'c3']);
+  assert.equal(await page.getAttribute('th:has(button[data-sort="points"])', 'aria-sort'), 'descending');
+  await page.getByRole('button', { name: 'Rider', exact: true }).click();
+  assert.deepEqual(await ids(), ['c2', 'c3', 'c1']);              // 7, 15, 42
+  if (process.env.SHOTS) { await page.setViewportSize({ width: 1200, height: 520 }); await page.screenshot({ path: 'tmp/scorer-table.png' }); }
+
+  // Deny from the row needs that row's reason
+  const row = page.locator('#table-pending tr', { has: page.locator('[data-id="c2"]') });
+  await row.getByRole('button', { name: 'Deny' }).click();
+  await page.getByText('Enter a reason to deny.').waitFor();
+  await row.getByRole('textbox').fill('wrong bridge');
+  await row.getByRole('button', { name: 'Deny' }).click();
+  await page.waitForResponse((r) => r.url().includes('scorer_decide'));
+  assert.deepEqual(calls.find((c) => c.key.includes('scorer_decide')).json,
+    { p_claim_id: 'c2', p_status: 'denied', p_reason: 'wrong bridge' });
+
+  // View and sort are remembered
+  await page.reload();
+  await page.locator('#table-pending [data-act="approved"]').first().waitFor();
+  assert.deepEqual(await ids(), ['c2', 'c3', 'c1']);
+  assert.deepEqual(errors, []);
+});
+
+test('activity: tiles, claim feed, riders never seen, scorer sign-ins', async () => {
+  const ago = (m) => new Date(Date.now() - m * 60000).toISOString();
+  const { page, errors } = await newPage({
+    'POST /rest/v1/rpc/is_scorer': () => ({ json: true }),
+    'GET /rest/v1/claim_activity': () => ({ json: [
+      { id: 3, at: ago(2), action: 'approved', actor: 'scorer@example.com', rider_number: 42, rider_name: 'Jane Smith', bonus_code: 'ABCD', bonus_name: 'Old mill', points: 100 },
+      { id: 2, at: ago(5), action: 'denied', actor: 'scorer@example.com', rider_number: 7, rider_name: 'Bob Jones', bonus_code: 'WXYZ', bonus_name: 'Covered bridge', points: 50, reason: 'wrong bridge' },
+      { id: 1, at: ago(9), action: 'submitted', actor: 'rider 42', rider_number: 42, rider_name: 'Jane Smith', bonus_code: 'ABCD', bonus_name: 'Old mill', points: 100 },
+    ] }),
+    'GET /rest/v1/rider_activity': () => ({ json: [
+      { rider_number: 42, name: 'Jane Smith', last_seen_at: ago(3), claims: 2, pending: 1, approved: 1, denied: 0, last_claim_at: ago(9), score: 100 },
+      { rider_number: 7, name: 'Bob Jones', last_seen_at: ago(30), claims: 1, pending: 0, approved: 0, denied: 1, last_claim_at: ago(40), score: 0 },
+      { rider_number: 15, name: 'Ana Diaz', last_seen_at: null, claims: 0, pending: 0, approved: 0, denied: 0, last_claim_at: null, score: 0 },
+    ] }),
+    'POST /rest/v1/rpc/scorer_list': () => ({ json: [{ email: 'scorer@example.com', last_sign_in_at: ago(60 * 24) }] }),
+  }, { session: true });
+
+  await page.goto(`${APP}activity.html`);
+  await page.locator('#feed table.data').waitFor();
+  assert.equal(await page.textContent('#t-seen'), '2 / 3');
+  assert.equal(await page.textContent('#t-claimed'), '2 / 3');
+  assert.equal(await page.textContent('#t-pending'), '1');
+  assert.equal(await page.textContent('#t-last'), '9 min ago');
+  assert.equal(await page.locator('#feed tbody tr').count(), 3);
+  assert.ok(await page.getByRole('cell', { name: 'Rider 42' }).isVisible());
+  assert.ok(await page.getByRole('cell', { name: 'wrong bridge' }).isVisible());
+  await page.fill('#feed-filter', '7');
+  assert.equal(await page.locator('#feed tbody tr').count(), 1);
+  if (process.env.SHOTS) { await page.setViewportSize({ width: 1200, height: 700 }); await page.fill('#feed-filter', ''); await page.screenshot({ path: 'tmp/activity-feed.png' }); }
+
+  await page.getByRole('button', { name: 'Riders', exact: true }).click();
+  const nums = () => page.$$eval('#riders tbody tr td:first-child', (els) => els.map((e) => e.textContent));
+  assert.deepEqual(await nums(), ['7', '15', '42']);
+  assert.equal(await page.locator('#riders tr.attention').count(), 1, 'never-seen rider highlighted');
+  await page.getByRole('button', { name: 'Last seen' }).click();   // newest first
+  await page.getByRole('button', { name: 'Last seen' }).click();   // oldest first: never seen on top
+  assert.deepEqual(await nums(), ['15', '7', '42']);
+  if (process.env.SHOTS) await page.screenshot({ path: 'tmp/activity-riders.png' });
+
+  await page.getByRole('button', { name: 'Scorers', exact: true }).click();
+  assert.ok(await page.getByRole('cell', { name: 'scorer@example.com' }).isVisible());
+  assert.deepEqual(errors, []);
+});
+
 test('scorer: signed-out user gets the email login; non-scorer is told so', async () => {
   const { page } = await newPage({});
   await page.goto(`${APP}scorer.html`);

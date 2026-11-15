@@ -100,6 +100,7 @@ web/styles.css
 web/index.html             landing
 web/rider.html
 web/scorer.html
+web/activity.html          scorer activity: claim feed, riders last seen, scorer sign-ins
 web/admin.html
 web/leaderboard.html
 ```
@@ -132,6 +133,9 @@ Supabase SQL Editor and Run; safe to re-run; run reset.sql first to start over.
 - `email text`
 - `token uuid not null unique default gen_random_uuid()`
 - `created_at timestamptz not null default now()`
+- `last_seen_at timestamptz` (when the rider last opened their page; null = link never opened).
+  Added with `alter table riders add column if not exists last_seen_at timestamptz;` so re-runs upgrade
+  an existing database.
 
 **bonuses**
 - `code text primary key check (code ~ '^([A-Z]{4}|[A-Z]{3}[0-9])$')` (4 letters, or 3 letters + 1 digit)
@@ -214,12 +218,21 @@ All user-facing errors use `errcode = 'P0001'` unless noted, so the message reac
 - `claims_detail`: `claims.*` + `rider_number`, `rider_name`, `bonus_name`, `points`,
   `bonus_is_combo` (via `is_combo`).
 
+**Activity views** (also `security_invoker = true`, so RLS limits them to scorers):
+- `claim_activity`: one row per `claim_events` row joined to claims, riders, bonuses:
+  `id, at, action, actor, from_status, to_status, reason, claim_id, rider_number, rider_name,
+  bonus_code, bonus_name, points`.
+- `rider_activity`: one row per rider: `rider_number, name, last_seen_at, claims` (count),
+  `pending, approved, denied` (counts by status), `last_claim_at` (max submitted_at),
+  `score` (from `rider_scores`, default 0).
+
 Scoring rule (matches the old sheet): sum of approved positive bonuses, then multiplied by
 `(1 + worst approved penalty / 100)`. Example: 160 pts with LAT1 (-25) = 120.
 
 ### 4.5 Rider functions (anon key + token, security definer)
 
-**`rider_session(p_token uuid) returns json`** (stable):
+**`rider_session(p_token uuid) returns json`** (volatile, because it records the visit): first sets
+`riders.last_seen_at = now()` when it is null or older than 1 minute (keeps writes low), then returns:
 ```
 { event_name, claims_open, max_attempts,
   rider: { number, name },
@@ -263,6 +276,8 @@ Security definer, callable by anon.
   `submitted_by = current_email()`. No photo, attempt or open/closed checks (staff override).
   On unique_violation: `'Rider % already has bonus % approved.'`
 - `scorer_new_token(p_rider_number int) returns uuid`: sets a new random token (old link dies).
+- `scorer_list() returns table (email text, last_sign_in_at timestamptz)`: every `scorers` email with
+  the latest `auth.users.last_sign_in_at` matched case-insensitively (null if never signed in), ordered by email.
 - `scorer_delete_all_claims(p_confirm text) returns int`: requires exactly `'DELETE ALL CLAIMS'`
   (else `'Type DELETE ALL CLAIMS to confirm.'`); deletes all claims (events cascade); returns count.
 
@@ -276,14 +291,14 @@ Security definer, callable by anon.
   - `grant usage on schema public to anon, authenticated, service_role`
   - `revoke all on all tables / sequences in schema public from anon, authenticated`
   - authenticated: select/insert/update/delete on settings, riders, bonuses, combo_members;
-    select on scorers, claims, claim_events and the four views; usage/select on `riders_id_seq`.
+    select on scorers, claims, claim_events and the six views (four scoring + two activity); usage/select on `riders_id_seq`.
   - service_role: all on tables and sequences.
   - anon: **no table access at all**.
 - Functions: `revoke execute on all functions in schema public from public, anon, authenticated`, then:
   - anon + authenticated: `rider_session`, `rider_submit`, `leaderboard`, `is_scorer`,
     `current_email`, `rider_token_valid`, `is_combo`
   - authenticated only: `scorer_decide`, `scorer_add_claim`, `scorer_new_token`,
-    `scorer_delete_all_claims`, `require_scorer`
+    `scorer_delete_all_claims`, `scorer_list`, `require_scorer`
 
 ### 4.9 Storage
 
@@ -299,8 +314,8 @@ Security definer, callable by anon.
 
 ### 4.10 `supabase/reset.sql`
 
-Drops the three storage policies, the views (`claims_detail, rider_scores, approved_effective,
-approved_direct`), the tables, every function with its full signature, and the `claim_events`
+Drops the three storage policies, the views (`claim_activity, rider_activity, claims_detail, rider_scores,
+approved_effective, approved_direct`), the tables, every function with its full signature, and the `claim_events`
 type, all with `if exists ... cascade`. Comment notes photos in the bucket are not deleted.
 
 ---
@@ -342,12 +357,19 @@ iss `supabase-demo`).
 - `renderLogin(container, onDone)`: "Scorer sign in" card, email field, "Email me a link" button;
   `signInWithOtp({ email (lower), options: { emailRedirectTo: current URL without hash } })`;
   success message `Check <email> for the sign-in link. Open it on this device.`; calls `onDone` on `SIGNED_IN`.
-- `navBar(active)`: links Review (scorer.html), Admin (admin.html), Leader board; "Sign out" link-button
+- `remember(key, fallback)` / `keep(key, value)`: JSON in localStorage, never throws (private mode).
+- `sortableTable(el, cols, opts)`: renders `<div class="table-wrap"><table class="data">` into `el`;
+  returns `{ set(rows) }`. Column: `{ key, label, num, desc, value(row), cell(row), cls, nosort }`
+  (`desc` = first click sorts high-to-low; `cell` returns HTML, default is the escaped value).
+  Header buttons `.th-sort[data-sort]`; clicking the current column reverses it. Active header gets
+  `aria-sort` (CSS draws the arrow). Blank values sort as smallest. Stable sort. Options:
+  `sort {key, dir}` default, `store` (localStorage key remembering the sort), `empty` text, `rowClass(row)`.
+- `navBar(active)`: links Review (scorer.html), Activity (activity.html), Admin (admin.html), Leader board; "Sign out" link-button
   `#sign-out` aligned right. `wireSignOut()` signs out and reloads.
 
 ### 5.3 `index.html`
 Title "Rally Scoring". Card: "Riders: use the personal link the rally staff sent you." and links to
-leader board, scorer review, admin.
+leader board, scorer review, activity, admin.
 
 ### 5.4 `rider.html` (most important; beginners on phones)
 - Token from `?t=`; saved to `localStorage.rally_token`; if absent, read from localStorage
@@ -395,10 +417,39 @@ leader board, scorer review, admin.
   badge, decider, time and reason.
 - Pending actions: Approve (green), reason input, Deny (red). Deny without a reason focuses the input
   and warns `'Enter a reason to deny.'`. Decided: "Revert to pending". All via `rpc('scorer_decide')`.
-- Auto-refresh every 20 s when the page is visible and on the Pending tab.
+- Auto-refresh every 20 s when the page is visible and on the Pending tab, skipped while any reason
+  input has text or focus (a redraw would wipe a half-typed reason).
+- **Cards / Table** switch (`#view-switch`, remembered as `review_view`). Table view (Pending and
+  Decided) uses `sortableTable`, widens the page (`main.wide`), and keeps the same `data-act`,
+  `data-reason`, `data-zoom` attributes so the same click handler decides and zooms. Only one view
+  holds action inputs at a time.
+  - Pending columns: Photo (44px thumb, or combo/none), Submitted, Rider, Name, Bonus, Points, By,
+    Photo time, Note, Decide (Approve / reason input / Deny). Default sort Submitted ascending.
+  - Decided columns: Photo, Decided, Status badge, Rider, Name, Bonus, Points, Decided by, Reason,
+    Submitted, Revert. Default sort Decided descending. With 100 rows shows
+    `Showing the latest 100 decisions. Use the filter to find older ones.`
+  - Sorts remembered as `review_sort_pending` / `review_sort_decided`.
 - Add claim tab: rider number, bonus select (all bonuses incl. penalties: `CODE - name (points)`),
   status select (Approve now / Add as pending), note, optional photo (shrunk, uploaded to `scorer/<uuid>.<ext>`),
   `rpc('scorer_add_claim')`. Help text: "For riders who could not submit themselves, penalties, or checkpoint entries."
+
+### 5.5a `activity.html`
+- Same sign-in / not-scorer handling as scorer.html. `main.wide`. Heading "Activity", line
+  `Updated <time> - refreshes every 30 seconds`, Refresh button; auto-refresh every 30 s when visible.
+- Tiles: `<seen> / <riders>` riders opened their link; `<n> / <riders>` riders have sent a claim;
+  total pending (waiting for review); last rider claim (`ago()`).
+- Tabs (remembered as `activity_tab`): **Claim activity**, **Riders**, **Scorers**.
+  - Claim activity: newest 300 rows of `claim_activity`; filter box (digits = rider number, else
+    bonus code prefix or actor contains). Columns Time, Who (`rider 42` shown as `Rider 42`), Action
+    badge, Rider, Name, Bonus, Points, Reason. Default sort Time descending.
+  - Riders: `rider_activity`. Columns #, Name, Last seen, Claims, Pending, Approved, Denied, Last claim,
+    Score. Rows with no `last_seen_at` get class `attention` (highlighted). Help text: highlighted riders
+    have never opened their link. Default sort # ascending.
+  - Scorers: `rpc('scorer_list')`. Columns Email, Last sign-in.
+- Times show `ago()`: `never`, `just now`, `<n> min ago`, `<h> h <m> min ago` under 6 hours, else `fmtTime`;
+  full time in the cell `title`. Sorts remembered as `activity_sort_feed|riders|scorers`.
+- Activity is recorded by the database only: claim events (trigger), rider visits (`rider_session`),
+  scorer sign-ins (Supabase Auth). Supabase's own logs are not used.
 
 ### 5.6 `admin.html`
 - Loads PapaParse. Same sign-in / not-scorer handling (`Not on the scorer list.`).
@@ -439,7 +490,10 @@ accent, ok/warn/err + backgrounds, info-bg). `[hidden] { display:none !important
 `.badge` (+ `.approved/.pending/.denied`), `.list`, `.bonus-btn`, `.bonus-code` (monospace bold),
 `.photo-preview`, `.claim` (140px grid, single column under 520px), `.nav`, `.tabs` (active = filled accent),
 `.table-wrap`, `.num`, `.big-board`, `.big`, button variants `.secondary/.danger/.ok/.link`,
-`.score-card`, `.score-total` (2rem), `.check`, `.group-head` (uppercase muted heading).
+`.score-card`, `.score-total` (2rem), `.check`, `.group-head` (uppercase muted heading),
+`table.data` (dense 0.9rem, sticky header, `td.wrap` for long text, `img.thumb` 44px, `.row-actions`),
+`.th-sort` with `aria-sort` arrows, `tr.attention` (warn background), `.wide` (max-width 1280px),
+`.tiles` / `.tile` (activity counters), `.view-switch`.
 
 ---
 
@@ -480,7 +534,8 @@ email sign-in enabled. Local ports: API 54321, Studio 54323, Mailpit 54324.
 ### 7.1 `tests/supabase_stubs.sql`
 Creates roles `anon`, `authenticated` (nologin) and `service_role` (bypassrls); schema `auth` with
 `auth.jwt()` reading `current_setting('request.jwt.claims', true)` as jsonb (default `{}`); schema
-`storage` with `buckets` and `objects` (RLS enabled), `storage.foldername(name)`; grants mirroring
+`storage` with `buckets` and `objects` (RLS enabled), `storage.foldername(name)`;
+`auth.users (id, email, last_sign_in_at)` for `scorer_list`; grants mirroring
 Supabase defaults: schema usage, select/insert on storage.objects, default execute on functions for
 anon/authenticated, **no default table grants** (schema.sql must grant itself).
 
@@ -498,8 +553,10 @@ Load stubs then the real `supabase/schema.sql`. Helpers switch role with `set ro
 7. only scorers can decide; status rules and audit (no approved->denied, revert, evidence locked,
    events logged)
 8. scoring: combos auto-count and penalties scale the score
-9. closing claims and scorer reset
-10. reset.sql removes everything (then schema.sql reloads cleanly)
+9. activity: rider last seen (updated when stale, not rewritten within a minute), claim feed, rider
+   summary, scorer sign-ins (case-insensitive match; non-scorer and anon refused)
+10. closing claims and scorer reset
+11. reset.sql removes everything (then schema.sql reloads cleanly)
 
 ### 7.3 `tests/web.test.mjs` (Playwright Chromium)
 - If `tmp/supabase.esm.js` is missing, bundle it:
@@ -514,9 +571,11 @@ Load stubs then the real `supabase/schema.sql`. Helpers switch role with `set ro
   2. rider: combo can be sent without a photo; approved bonus is blocked; bad link explains itself
   3. rider: score at the top; claimed bonuses grouped, filtered and remembered
   4. scorer: sees pending claim with photo, deny needs a reason, approve calls the API
-  5. scorer: signed-out user gets the email login; non-scorer is told so
-  6. admin: CSV import validates, then upserts riders with the sheet column names
-  7. leader board renders scores
+  5. scorer: table view is sortable, decides from the row, and is remembered
+  6. activity: tiles, claim feed, riders never seen, scorer sign-ins
+  7. scorer: signed-out user gets the email login; non-scorer is told so
+  8. admin: CSV import validates, then upserts riders with the sheet column names
+  9. leader board renders scores
 
 All tests must pass with `npm test` before the work is called done.
 
@@ -566,7 +625,7 @@ ARSN,WXYZ
 
 ## 10. Done when
 
-1. `npm install && npm run test:setup && npm test` passes all 17 tests.
+1. `npm install && npm run test:setup && npm test` passes all 20 tests.
 2. Pasting `schema.sql` into a fresh Supabase project runs without errors, and running it twice is harmless.
 3. Following README setup with the `samples/` CSVs, a rider can submit from a phone, a scorer can
    approve, and the leader board shows the score (ABCD + WXYZ approved = 175 with combo ARSN).
