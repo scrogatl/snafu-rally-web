@@ -90,6 +90,7 @@ supabase/config.toml       Supabase CLI config (project_id snafu-rally-web)
 supabase/.gitignore        .branches, .temp, .env.keys, .env.local, .env.*.local
 supabase/schema.sql        the whole database (idempotent, paste into SQL Editor)
 supabase/reset.sql         drops everything schema.sql creates
+supabase/functions/rider-photo/index.ts  Edge Function: signed links to a rider's own photos
 tests/supabase_stubs.sql   minimal auth/storage/roles stand-ins for PGlite
 tests/schema.test.mjs      DB tests
 tests/web.test.mjs         browser tests
@@ -240,10 +241,18 @@ Scoring rule (matches the old sheet): sum of approved positive bonuses, then mul
   bonuses: [ { code, name, points, description, is_combo,
                counted,      // in approved_effective for this rider
                attempts,     // count of this rider's claims for the bonus
-               status } ] }  // 'approved' if any approved, else 'pending' if any pending,
+               status,       // 'approved' if any approved, else 'pending' if any pending,
                              // else 'denied' if any claims, else null
+               history: [ { status, submitted_at, photo_path, reason, by_staff } ] } ] }
+                             // this rider's claims for the bonus, newest first;
+                             // by_staff = submitted_by not like 'rider %'
 ```
 Bonuses: only `points >= 0` (penalties hidden from riders), ordered `sort_order nulls last, code`.
+
+**`rider_photo_paths(p_token uuid) returns text[]`** (stable, security definer, **service_role only**):
+resolves the rider (bad token raises the usual "not valid" message) and returns every non-null
+`photo_path` of that rider's claims, oldest first (`'{}'` if none). Used only by the `rider-photo`
+Edge Function to decide which photos it may sign.
 
 **`rider_submit(p_token uuid, p_client_id uuid, p_bonus_code text, p_photo_path text default null,
 p_note text default null, p_taken_at timestamptz default null) returns json`** (volatile). In order:
@@ -299,6 +308,7 @@ Security definer, callable by anon.
     `current_email`, `rider_token_valid`, `is_combo`
   - authenticated only: `scorer_decide`, `scorer_add_claim`, `scorer_new_token`,
     `scorer_delete_all_claims`, `scorer_list`, `require_scorer`
+  - service_role only: `rider_photo_paths`
 
 ### 4.9 Storage
 
@@ -311,10 +321,26 @@ Security definer, callable by anon.
   - `scorer_upload` FOR INSERT to authenticated: bucket `claims` and `public.is_scorer()`
   - `scorer_read_photos` FOR SELECT to authenticated: bucket `claims` and `public.is_scorer()`
 - Paths: riders `<token>/<client_id>.<ext>`; scorers `scorer/<uuid>.<ext>`.
+- **No rider read policy, on purpose.** Riders have no login, so a read rule could only check that a
+  folder belongs to *some* rider; anyone with the anon key could then list the bucket and read every
+  folder name, which is a rider token. Riders see their photos through the Edge Function instead.
+
+### 4.9a Edge Function `supabase/functions/rider-photo/index.ts` (Deno)
+- `POST { token, paths? }` -> `{ photos: { "<path>": "/storage/v1/object/sign/claims/...?token=..." } }`.
+  OPTIONS returns CORS headers (`*`; headers `authorization, x-client-info, apikey, content-type`).
+- Token must look like a UUID, else 400 with the "rider link is not valid" message.
+- Service-role client (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` env, provided by Supabase) calls
+  `rpc('rider_photo_paths')`; "not valid" error -> 400 with that message. If `paths` given, keep only
+  owned paths that were asked for. `createSignedUrls(wanted, 3600)`; files that no longer exist are left out.
+- Returns signed links **without the host** (pathname + search): inside local Supabase the function
+  sees an internal address, so the page prefixes its own `SUPABASE_URL`.
+- Imports `npm:@supabase/supabase-js@2.45.4`. Deployed with JWT verification off
+  (`npx supabase functions deploy rider-photo --no-verify-jwt`; `[functions.rider-photo] verify_jwt = false`
+  in config.toml): the rider token is the check and the anon key is public anyway.
 
 ### 4.10 `supabase/reset.sql`
 
-Drops the three storage policies, the views (`claim_activity, rider_activity, claims_detail, rider_scores,
+Drops the three storage policies, `rider_photo_paths(uuid)`, the views (`claim_activity, rider_activity, claims_detail, rider_scores,
 approved_effective, approved_direct`), the tables, every function with its full signature, and the `claim_events`
 type, all with `if exists ... cascade`. Comment notes photos in the bucket are not deleted.
 
@@ -390,7 +416,16 @@ leader board, scorer review, activity, admin.
   approved `Approved`; counted `Counted - all parts approved`; pending `Waiting for review`;
   denied `Denied - you can try again` or `Denied - no attempts left`.
 - **Claim view** (tap a bonus): back link "<- All bonuses", code + name, `<pts> pts - X of N attempts used`,
-  description. Photo input `accept="image/*"` with label "(required)" or "(not needed for a combo)",
+  description, then **Your submissions** (`#c-history`, hidden when the bonus has no history): one item
+  per history entry, newest first: status badge (`Approved` / `Waiting for review` / `Denied`),
+  `sent <time>` plus ` by rally staff` when `by_staff`, `Reason: <reason>` for denied ones, and either
+  `No photo` / `No photo (combo)` or a **Show photo** button. Tapping it calls
+  `sb.functions.invoke('rider-photo', { body: { token, paths } })` once for all of that bonus's photos not
+  yet loaded (button shows "Loading photo..."), stores `SUPABASE_URL + link` per path for the visit, and
+  shows each photo as `.photo-preview`; a path missing from the reply shows `Photo not found.`. Errors go to
+  `#c-history-msg` (function message if any, network text for fetch errors) and the button comes back.
+  If an image fails to load (link expired after an hour) it returns to the button. No photo traffic
+  until the rider taps. Photo input `accept="image/*"` with label "(required)" or "(not needed for a combo)",
   preview image, optional note (max 500), big "Submit bonus" button.
   Blocked (form hidden, warn shown): claims closed; already approved; combo already counted;
   out of attempts (`'You have used all attempts for this bonus. See rally staff.'`).
@@ -415,7 +450,7 @@ leader board, scorer review, activity, admin.
   `Combo - no photo needed` / `No photo`; code, name, points, rider number and name,
   `Submitted <time> by <who>` plus `- photo file time <time>`, note, and for decided claims a status
   badge, decider, time and reason.
-- Pending actions: Approve (green), reason input, Deny (red). Deny without a reason focuses the input
+- Pending actions: Approve (green), reason input (placeholder says the rider sees it), Deny (red). Deny without a reason focuses the input
   and warns `'Enter a reason to deny.'`. Decided: "Revert to pending". All via `rpc('scorer_decide')`.
 - Auto-refresh every 20 s when the page is visible and on the Pending tab, skipped while any reason
   input has text or focus (a redraw would wipe a half-typed reason).
@@ -493,7 +528,7 @@ accent, ok/warn/err + backgrounds, info-bg). `[hidden] { display:none !important
 `.score-card`, `.score-total` (2rem), `.check`, `.group-head` (uppercase muted heading),
 `table.data` (dense 0.9rem, sticky header, `td.wrap` for long text, `img.thumb` 44px, `.row-actions`),
 `.th-sort` with `aria-sort` arrows, `tr.attention` (warn background), `.wide` (max-width 1280px),
-`.tiles` / `.tile` (activity counters), `.view-switch`.
+`.tiles` / `.tile` (activity counters), `.view-switch`, `h3`, `.history-item` (rider submissions).
 
 ---
 
@@ -523,9 +558,13 @@ with comments: set the two env vars in Netlify; both are public by design.
 **`web/serve.json`**: `{ "cleanUrls": false }` - otherwise `serve` redirects `rider.html?t=...`
 to `/rider` and drops the token.
 
+**Edge Function deploy (hosted)**: `npx supabase login`, then
+`npx supabase functions deploy rider-photo --no-verify-jwt --project-ref <ref>`. Local `supabase start`
+serves it at `http://127.0.0.1:54321/functions/v1/rider-photo`. Netlify is not involved.
+
 **`supabase/config.toml`**: Supabase CLI defaults with `project_id = "snafu-rally-web"`,
 `[auth] site_url = "http://localhost:8080"`, `additional_redirect_urls = ["http://localhost:8080/**"]`,
-email sign-in enabled. Local ports: API 54321, Studio 54323, Mailpit 54324.
+email sign-in enabled, `[functions.rider-photo] verify_jwt = false`. Local ports: API 54321, Studio 54323, Mailpit 54324.
 
 ---
 
@@ -556,7 +595,10 @@ Load stubs then the real `supabase/schema.sql`. Helpers switch role with `set ro
 9. activity: rider last seen (updated when stale, not rewritten within a minute), claim feed, rider
    summary, scorer sign-ins (case-insensitive match; non-scorer and anon refused)
 10. closing claims and scorer reset
-11. reset.sql removes everything (then schema.sql reloads cleanly)
+11. rider sees own submission history; photo lookup is for the Edge Function only (history newest
+    first with staff flag and reason; `rider_photo_paths` only this rider's paths, refused for anon and
+    scorers; anon cannot list storage)
+12. reset.sql removes everything (then schema.sql reloads cleanly)
 
 ### 7.3 `tests/web.test.mjs` (Playwright Chromium)
 - If `tmp/supabase.esm.js` is missing, bundle it:
@@ -570,12 +612,15 @@ Load stubs then the real `supabase/schema.sql`. Helpers switch role with `set ro
   1. rider: submit with photo, survives a dropped connection without re-uploading
   2. rider: combo can be sent without a photo; approved bonus is blocked; bad link explains itself
   3. rider: score at the top; claimed bonuses grouped, filtered and remembered
-  4. scorer: sees pending claim with photo, deny needs a reason, approve calls the API
-  5. scorer: table view is sortable, decides from the row, and is remembered
-  6. activity: tiles, claim feed, riders never seen, scorer sign-ins
-  7. scorer: signed-out user gets the email login; non-scorer is told so
-  8. admin: CSV import validates, then upserts riders with the sheet column names
-  9. leader board renders scores
+  4. rider: sees past submissions with the reason, and their photo on tap (one function call, missing
+     photo says so, no photo traffic before the tap)
+  5. rider: photo viewer explains a failure and lets the rider retry
+  6. scorer: sees pending claim with photo, deny needs a reason, approve calls the API
+  7. scorer: table view is sortable, decides from the row, and is remembered
+  8. activity: tiles, claim feed, riders never seen, scorer sign-ins
+  9. scorer: signed-out user gets the email login; non-scorer is told so
+  10. admin: CSV import validates, then upserts riders with the sheet column names
+  11. leader board renders scores
 
 All tests must pass with `npm test` before the work is called done.
 
@@ -625,7 +670,7 @@ ARSN,WXYZ
 
 ## 10. Done when
 
-1. `npm install && npm run test:setup && npm test` passes all 20 tests.
+1. `npm install && npm run test:setup && npm test` passes all 23 tests.
 2. Pasting `schema.sql` into a fresh Supabase project runs without errors, and running it twice is harmless.
 3. Following README setup with the `samples/` CSVs, a rider can submit from a phone, a scorer can
    approve, and the leader board shows the score (ABCD + WXYZ approved = 175 with combo ARSN).

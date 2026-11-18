@@ -29,6 +29,13 @@ account connected to this GitHub repo.
    insert into scorers (email) values ('you@example.com');
    ```
 4. Project Settings -> API: copy the **Project URL** and the **anon public** key.
+5. Deploy the photo viewer for riders (Supabase Edge Function), from this repo folder:
+   ```
+   npx supabase login
+   npx supabase functions deploy rider-photo --no-verify-jwt --project-ref <project ref>
+   ```
+   The project ref is the `xxxx` in `https://xxxx.supabase.co`. Without this, everything works
+   except the rider's **Show photo** button.
 
 **2. Website (Netlify)**
 
@@ -63,6 +70,8 @@ Every push to `main` redeploys the site.
 - **The anon key is public by design.** The database only lets it use rider links, upload into
   that rider's folder and read the leader board.
 - **Rider links are secrets.** Admin -> **New link** cancels a lost or shared one.
+- **Riders see deny reasons.** A rider opening a bonus sees each of their submissions, the photo
+  (on tap) and the scorer's reason. Write reasons for the rider.
 - **Start over:** Admin -> Testing reset (claims only), or run `supabase/reset.sql` then
   `supabase/schema.sql` (everything).
 - **Free plans:** Supabase pauses after a week idle (resume from the dashboard, data is kept) and

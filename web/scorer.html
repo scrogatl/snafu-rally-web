@@ -90,7 +90,7 @@ function makeTables() {
     { key: 'note', label: 'Note', cls: 'wrap' },
     { key: 'actions', label: 'Decide', nosort: true, cell: (r) => `<div class="row-actions">
         <button type="button" class="ok" data-act="approved" data-id="${esc(r.id)}">Approve</button>
-        <input type="text" placeholder="Reason to deny" data-reason="${esc(r.id)}" maxlength="500" aria-label="Reason to deny ${esc(r.bonus_code)} for rider ${esc(r.rider_number)}">
+        <input type="text" placeholder="Reason (rider sees it)" data-reason="${esc(r.id)}" maxlength="500" aria-label="Reason to deny ${esc(r.bonus_code)} for rider ${esc(r.rider_number)}">
         <button type="button" class="danger" data-act="denied" data-id="${esc(r.id)}">Deny</button></div>` },
   ], { sort: { key: 'submitted_at', dir: 'asc' }, store: 'review_sort_pending', empty: 'Nothing waiting. Nice.' });
   tables.decided = sortableTable($('#table-decided'), [
@@ -168,7 +168,7 @@ function claimCard(c, url) {
   const actions = c.status === 'pending'
     ? `<div class="row">
          <button type="button" class="ok" data-act="approved" data-id="${c.id}">Approve</button>
-         <input type="text" class="grow" placeholder="Reason (needed to deny)" data-reason="${c.id}" maxlength="500">
+         <input type="text" class="grow" placeholder="Reason to deny (rider sees it)" data-reason="${c.id}" maxlength="500">
          <button type="button" class="danger" data-act="denied" data-id="${c.id}">Deny</button>
        </div>`
     : `<button type="button" class="secondary" data-act="pending" data-id="${c.id}">Revert to pending</button>`;

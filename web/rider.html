@@ -43,6 +43,11 @@
         <p class="muted" id="c-meta"></p>
         <p id="c-desc"></p>
       </div>
+      <div id="c-history" class="stack" hidden>
+        <h3>Your submissions</h3>
+        <ul class="list" id="c-history-list"></ul>
+        <div id="c-history-msg" class="msg" hidden></div>
+      </div>
       <div id="c-blocked" class="msg warn" hidden></div>
       <form id="claim-form" class="stack">
         <label class="stack">
@@ -62,7 +67,8 @@
 </main>
 
 <script type="module">
-import { sb, $, esc, errorText, showMessage, setupBanner, shrinkImage, newId, BUCKET } from './lib.js';
+import { sb, $, esc, fmtTime, errorText, showMessage, setupBanner, shrinkImage, newId, BUCKET } from './lib.js';
+import { SUPABASE_URL } from './config.js';
 setupBanner();
 
 // Token comes from the personal link (?t=...). Remember it so a home screen icon works later.
@@ -82,6 +88,50 @@ const statusLabel = {
   pending: ['pending', 'Waiting for review'],
   denied: ['denied', 'Denied - you can try again'],
 };
+
+// Photos of past submissions: path -> signed link (null = file not found). Kept for this visit only.
+const photoUrls = {};
+const historyLabel = { approved: 'Approved', pending: 'Waiting for review', denied: 'Denied' };
+
+function renderHistory() {
+  const h = current.history || [];
+  $('#c-history').hidden = !h.length;
+  $('#c-history-list').innerHTML = h.map((c) => {
+    let photo;
+    if (!c.photo_path) photo = `<span class="muted">${current.is_combo ? 'No photo (combo)' : 'No photo'}</span>`;
+    else if (photoUrls[c.photo_path]) photo = `<img class="photo-preview" src="${esc(photoUrls[c.photo_path])}" data-path="${esc(c.photo_path)}" alt="Your photo for ${esc(current.code)}">`;
+    else if (photoUrls[c.photo_path] === null) photo = '<span class="muted">Photo not found.</span>';
+    else photo = `<button type="button" class="secondary" data-photo="${esc(c.photo_path)}">Show photo</button>`;
+    return `<li class="history-item">
+      <div><span class="badge ${esc(c.status)}">${historyLabel[c.status] || esc(c.status)}</span>
+        <span class="muted">sent ${esc(fmtTime(c.submitted_at))}${c.by_staff ? ' by rally staff' : ''}</span>
+        ${c.status === 'denied' && c.reason ? `<br>Reason: ${esc(c.reason)}` : ''}</div>
+      ${photo}</li>`;
+  }).join('');
+}
+
+// Ask the rider-photo Edge Function for signed links to this bonus's photos (only on tap, to save data)
+async function showPhotos(btn) {
+  const paths = (current.history || []).map((c) => c.photo_path).filter((p) => p && !photoUrls[p]);
+  btn.disabled = true;
+  btn.textContent = 'Loading photo...';
+  showMessage($('#c-history-msg'), '');
+  try {
+    const { data, error } = await sb.functions.invoke('rider-photo', { body: { token, paths } });
+    if (error) {
+      let m = error.name === 'FunctionsFetchError' ? errorText(new Error('Failed to fetch')) : 'Could not load the photo.';
+      try { const j = await error.context.json(); if (j?.message) m = j.message; } catch (e) { /* keep m */ }
+      throw new Error(m);
+    }
+    const got = data?.photos || {};
+    for (const p of paths) photoUrls[p] = got[p] ? SUPABASE_URL + got[p] : null;
+    renderHistory();
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = 'Show photo';
+    showMessage($('#c-history-msg'), errorText(e), 'error');
+  }
+}
 
 // List view choices, remembered on this phone
 const prefs = { filter: 'all', group: true };
@@ -201,6 +251,8 @@ function openClaim(code, keepDraft = false) {
   $('#c-meta').textContent = `${current.points} pts` +
     (current.attempts ? ` - ${current.attempts} of ${session.max_attempts} attempts used` : '');
   $('#c-desc').textContent = current.description || '';
+  showMessage($('#c-history-msg'), '');
+  renderHistory();
   $('#photo-label').innerHTML = current.is_combo
     ? '<strong>Photo</strong> (not needed for a combo)'
     : '<strong>Photo</strong> (required)';
@@ -219,6 +271,15 @@ function openClaim(code, keepDraft = false) {
 }
 
 $('#search').addEventListener('input', renderList);
+$('#c-history-list').addEventListener('click', (ev) => {
+  const b = ev.target.closest('[data-photo]');
+  if (b) showPhotos(b);
+});
+// Signed links last an hour; if one has expired, go back to the "Show photo" button
+$('#c-history-list').addEventListener('error', (ev) => {
+  const img = ev.target.closest && ev.target.closest('img[data-path]');
+  if (img) { delete photoUrls[img.dataset.path]; renderHistory(); }
+}, true);
 $('#filter-tabs').addEventListener('click', (ev) => {
   const t = ev.target.closest('[data-filter]');
   if (!t) return;

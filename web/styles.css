@@ -104,3 +104,6 @@ tr.attention td { background: var(--warn-bg); }
 .tile { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
 .tile .n { font-size: 1.5rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 .view-switch button { min-height: 40px; padding: 6px 12px; }
+/* Rider: past submissions for a bonus */
+h3 { font-size: 1rem; margin: 0; }
+.history-item { display: flex; flex-direction: column; gap: 8px; padding: 10px 0; }

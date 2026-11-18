@@ -19,6 +19,9 @@ the code when behavior changes. Setup steps for people: `README.md`.
   Auth email links for scorers only.
 - Riders never log in. Each rider has a secret `token` in their link (`rider.html?t=...`). All rider
   actions go through SECURITY DEFINER functions that take the token (`rider_session`, `rider_submit`).
+- Riders have NO storage read rule (a rule could not tell riders apart, and listing would leak tokens).
+  They view their own photos via Edge Function `supabase/functions/rider-photo` (service role,
+  `rider_photo_paths(token)`), deployed with `--no-verify-jwt`.
 - Scorers = emails in the `scorers` table. RLS gives them full read; claim changes only through
   `scorer_decide` / `scorer_add_claim` so the status rules and audit always apply.
 - Scoring mirrors the old sheet: sum of approved positive points x (1 + worst approved penalty / 100).

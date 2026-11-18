@@ -231,6 +231,60 @@ test('rider: score at the top; claimed bonuses grouped, filtered and remembered'
   assert.deepEqual(errors, []);
 });
 
+test('rider: sees past submissions with the reason, and their photo on tap', async () => {
+  const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', 'base64');
+  const sess = session();
+  sess.bonuses[0] = { ...sess.bonuses[0], attempts: 2, status: 'denied', history: [
+    { status: 'denied', submitted_at: new Date().toISOString(), photo_path: `${TOKEN}/b.jpg`, reason: 'flag not visible', by_staff: false },
+    { status: 'denied', submitted_at: new Date(Date.now() - 3600e3).toISOString(), photo_path: `${TOKEN}/a.jpg`, reason: 'too dark', by_staff: false },
+  ] };
+  const { page, calls, errors } = await newPage({
+    'POST /rest/v1/rpc/rider_session': () => ({ json: sess }),
+    // a.jpg was deleted from storage, so only b.jpg comes back
+    'POST /functions/v1/rider-photo': () => ({ json: { photos: { [`${TOKEN}/b.jpg`]: `/storage/v1/object/sign/claims/${TOKEN}/b.jpg?token=x` } } }),
+    'GET /storage/v1/object/sign/claims/': (_c, r) => { r.fulfill({ contentType: 'image/png', body: PNG }); return 'handled'; },
+  });
+  await page.goto(`${APP}rider.html?t=${TOKEN}`);
+  await page.getByRole('button', { name: /ABCD/ }).click();
+  await page.getByText('Your submissions').waitFor();
+  assert.ok(await page.getByText('Reason: flag not visible').isVisible());
+  assert.ok(await page.getByText('Reason: too dark').isVisible());
+  assert.equal(await page.locator('[data-photo]').count(), 2);
+  assert.equal(calls.filter((c) => c.key.includes('rider-photo')).length, 0, 'no photo traffic until asked');
+
+  await page.locator('[data-photo]').first().click();
+  await page.locator('img[data-path]').waitFor();
+  const fn = calls.filter((c) => c.key === 'POST /functions/v1/rider-photo');
+  assert.equal(fn.length, 1, 'one call fetches every photo for the bonus');
+  assert.deepEqual(fn[0].json, { token: TOKEN, paths: [`${TOKEN}/b.jpg`, `${TOKEN}/a.jpg`] });
+  assert.equal(await page.getAttribute('img[data-path]', 'src'), `${API}/storage/v1/object/sign/claims/${TOKEN}/b.jpg?token=x`);
+  assert.ok(await page.getByText('Photo not found.').isVisible());
+  assert.ok(await page.locator('#claim-form').isVisible(), 'can still try again (2 of 3 attempts)');
+  if (process.env.SHOTS) { await page.setViewportSize({ width: 390, height: 900 }); await page.screenshot({ path: 'tmp/rider-history.png', fullPage: true }); }
+
+  // A bonus with no submissions shows no history section
+  await page.getByRole('button', { name: /All bonuses/ }).click();
+  await page.getByRole('button', { name: /ARSN/ }).click();
+  assert.equal(await page.isVisible('#c-history'), false);
+  assert.deepEqual(errors, []);
+});
+
+test('rider: photo viewer explains a failure and lets the rider retry', async () => {
+  const sess = session();
+  sess.bonuses[1] = { ...sess.bonuses[1], history: [
+    { status: 'approved', submitted_at: new Date().toISOString(), photo_path: `${TOKEN}/w.jpg`, reason: null, by_staff: false }] };
+  const { page, errors } = await newPage({
+    'POST /rest/v1/rpc/rider_session': () => ({ json: sess }),
+    'POST /functions/v1/rider-photo': () => ({ status: 400, json: { message: 'This rider link is not valid. Ask the rally staff for a new one.' } }),
+  });
+  await page.goto(`${APP}rider.html?t=${TOKEN}`);
+  await page.getByRole('button', { name: /WXYZ/ }).click();
+  await page.getByRole('button', { name: 'Show photo' }).click();
+  await page.locator('#c-history-msg', { hasText: 'rider link is not valid' }).waitFor();
+  assert.ok(await page.getByRole('button', { name: 'Show photo' }).isEnabled(), 'button is back for a retry');
+  assert.deepEqual(errors, []);
+});
+
 test('scorer: sees pending claim with photo, deny needs a reason, approve calls the API', async () => {
   const { page, calls, errors } = await newPage({
     'POST /rest/v1/rpc/is_scorer': () => ({ json: true }),

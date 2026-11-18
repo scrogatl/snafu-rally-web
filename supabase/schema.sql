@@ -302,10 +302,31 @@ begin
                                    when bool_or(c.status = 'pending')  then 'pending'
                                    when count(*) > 0                   then 'denied'
                                  end
-                          from claims c where c.rider_id = r.id and c.bonus_code = b.code))
+                          from claims c where c.rider_id = r.id and c.bonus_code = b.code),
+               -- This rider's submissions for the bonus, newest first. The page shows them with the
+               -- photo (signed by the rider-photo Edge Function) and the scorer's reason if denied.
+               'history', coalesce((
+                 select json_agg(json_build_object(
+                          'status', c.status, 'submitted_at', c.submitted_at, 'photo_path', c.photo_path,
+                          'reason', c.reason, 'by_staff', c.submitted_by not like 'rider %')
+                        order by c.submitted_at desc)
+                 from claims c where c.rider_id = r.id and c.bonus_code = b.code), '[]'::json))
              order by b.sort_order nulls last, b.code)
       from bonuses b where b.points >= 0), '[]'::json)
   );
+end $$;
+
+-- Photo paths belonging to a rider's claims. Only the rider-photo Edge Function calls this (as
+-- service_role) to decide which photos it may sign for a rider link. Riders get no storage read
+-- rule on purpose: without a login, such a rule could not tell riders apart, and listing the
+-- bucket would reveal every rider's folder name, which is their secret token.
+create or replace function rider_photo_paths(p_token uuid) returns text[]
+language plpgsql stable security definer set search_path = public as $$
+declare r riders;
+begin
+  r := rider_from_token(p_token);
+  return coalesce((select array_agg(photo_path order by submitted_at)
+                   from claims where rider_id = r.id and photo_path is not null), '{}');
 end $$;
 
 create or replace function rider_submit(
@@ -514,12 +535,14 @@ grant execute on function scorer_add_claim(int, text, claim_status, text, text, 
 grant execute on function scorer_new_token(int)                                     to authenticated;
 grant execute on function scorer_delete_all_claims(text)                            to authenticated;
 grant execute on function scorer_list()                                             to authenticated;
+grant execute on function rider_photo_paths(uuid)                                   to service_role;  -- Edge Function only
 grant execute on function require_scorer()                                          to authenticated;
 
 -- ---------------------------------------------------------------------------
 -- Photo storage: private bucket "claims"
 --   riders upload to  <their token>/<file>   (anon, insert only)
 --   scorers upload to scorer/<file> and can read everything
+--   riders view their own photos through the rider-photo Edge Function (no rider read rule here)
 -- ---------------------------------------------------------------------------
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values ('claims', 'claims', false, 10485760,

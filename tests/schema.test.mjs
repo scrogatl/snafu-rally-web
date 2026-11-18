@@ -242,6 +242,36 @@ test('closing claims and scorer reset', async () => {
   assert.equal((await db.query('select count(*)::int n from claim_events')).rows[0].n, 0);
 });
 
+test('rider sees own submission history; photo lookup is for the Edge Function only', async () => {
+  // Staff add a claim with their own photo for rider 7, deny it with a reason; rider 7 tries again
+  const staff = (await scorer((tx) => one(tx,
+    `select * from scorer_add_claim(7, 'ABC1', 'pending', null, 'scorer/staff1.jpg')`)));
+  await scorer((tx) => tx.query(`select scorer_decide($1, 'denied', 'too dark')`, [staff.id]));
+  await rider((tx) => tx.query('select rider_submit($1,$2,$3,$4,null,null)', [token7, uuid(), 'ABC1', `${token7}/h1.jpg`]));
+  await rider((tx) => tx.query('select rider_submit($1,$2,$3,$4,null,null)', [token42, uuid(), 'ABC1', `${token42}/other.jpg`]));
+
+  const s7 = (await rider((tx) => one(tx, 'select rider_session($1) as s', [token7]))).s;
+  const h = s7.bonuses.find((b) => b.code === 'ABC1').history;
+  assert.deepEqual(h.map((c) => [c.status, c.photo_path, c.by_staff, c.reason]), [
+    ['pending', `${token7}/h1.jpg`, false, null],                    // newest first
+    ['denied', 'scorer/staff1.jpg', true, 'too dark'],
+  ]);
+  assert.deepEqual(s7.bonuses.find((b) => b.code === 'ABCD').history, []);
+
+  // The Edge Function (service_role) gets only this rider's photo paths
+  const service = (fn) => as('service_role', null, fn);
+  const paths = (await service((tx) => one(tx, 'select rider_photo_paths($1) as p', [token7]))).p;
+  assert.deepEqual(paths, ['scorer/staff1.jpg', `${token7}/h1.jpg`]);
+  await rejects(service((tx) => tx.query('select rider_photo_paths($1)', [uuid()])), /rider link is not valid/);
+  await rejects(rider((tx) => tx.query('select rider_photo_paths($1)', [token7])), /permission denied/);
+  await rejects(as('authenticated', SCORER, (tx) => tx.query('select rider_photo_paths($1)', [token7])), /permission denied/);
+
+  // Riders still cannot list or read storage, so folder names (tokens) never leak
+  await rider((tx) => tx.query(`insert into storage.objects (bucket_id, name) values ('claims', $1)`, [`${token7}/h1.jpg`]));
+  assert.ok((await db.query('select count(*)::int n from storage.objects')).rows[0].n > 0);
+  assert.equal((await rider((tx) => tx.query('select * from storage.objects'))).rows.length, 0);
+});
+
 test('reset.sql removes everything', async () => {
   await db.exec(read('../supabase/reset.sql'));
   const left = (await db.query(`select count(*)::int n from pg_tables where schemaname = 'public'`)).rows[0].n;
