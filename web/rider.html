@@ -149,10 +149,12 @@ function badgeFor(b) {
   return ['', ''];
 }
 
-// "Claimed" = nothing more to do: approved, counted, waiting for review, or out of attempts.
-// A denied bonus with attempts left is still "to get", since the rider can try again.
+// "Claimed" = the rider has sent it: approved, counted, waiting for review, or denied.
+// A denied bonus with attempts left can be sent again, so it is also "to get".
 const isClaimed = (b) => b.counted || b.status === 'approved' || b.status === 'pending' ||
-  (b.status === 'denied' && outOfAttempts(b));
+  b.status === 'denied';
+const canRetry = (b) => b.status === 'denied' && !b.counted && !outOfAttempts(b);
+const isToGet = (b) => !isClaimed(b) || canRetry(b);
 
 function renderScore() {
   const s = session.score;
@@ -203,7 +205,7 @@ const groupHeading = (text, n) => `<li class="group-head">${esc(text)} (${n})</l
 function renderList() {
   const all = session.bonuses;
   const claimed = all.filter(isClaimed);
-  const todo = all.filter((b) => !isClaimed(b));
+  const todo = all.filter(isToGet);
   $('#n-todo').textContent = todo.length;
   $('#n-claimed').textContent = claimed.length;
   $('#n-all').textContent = all.length;
@@ -227,7 +229,8 @@ function renderList() {
     const items = claimed.filter(match);
     html = items.map(bonusItem).join('') || empty(q ? 'No bonuses match.' : 'No bonuses claimed yet.');
   } else if (prefs.group) {
-    const a = todo.filter(match), c = claimed.filter(match);
+    // Each bonus once here: one that can be sent again goes under "To get".
+    const a = todo.filter(match), c = claimed.filter((b) => !canRetry(b) && match(b));
     html = (a.length ? groupHeading('To get', a.length) + a.map(bonusItem).join('') : '') +
            (c.length ? groupHeading('Claimed', c.length) + c.map(bonusItem).join('') : '');
     html = html || empty('No bonuses match.');

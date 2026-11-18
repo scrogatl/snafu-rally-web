@@ -407,7 +407,8 @@ leader board, scorer review, activity, admin.
   Hidden if `session.score` is missing.
 - If claims closed: warn message `'Claims are closed.'`
 - **List view**: tabs `To get`, `Claimed`, `All`, each with a count. "Claimed" = counted, approved,
-  pending, or denied with no attempts left. A denied bonus with attempts left is "To get".
+  pending, or denied. "To get" = not claimed, or denied with attempts left (so that one is in both
+  tabs; the badge says it can be sent again). Grouped `All` lists it once, under `To get`.
   On `All`, checkbox "Group claimed bonuses together" shows headings `To get (n)` / `Claimed (n)`.
   Filter and group choice are remembered in `localStorage.rally_list_prefs` (default
   `{filter:'all', group:true}`). Search box filters by code or name. Empty states:

@@ -193,11 +193,11 @@ test('rider: score at the top; claimed bonuses grouped, filtered and remembered'
   assert.equal(await page.textContent('#score-line'),
     '2 bonuses approved - 1 waiting for review - includes a -10% penalty');
 
-  // Default: all, grouped. Denied with tries left is still "to get"; out of tries is claimed.
+  // Default: all, grouped. Denied with tries left is in both tabs, but listed once here (to get).
   assert.deepEqual(await heads(), ['To get (2)', 'Claimed (4)']);
   assert.deepEqual(await codes(), ['ABCD', 'DENY', 'WXYZ', 'ARSN', 'PEND', 'DEAD']);
   assert.equal(await page.textContent('#n-todo'), '2');
-  assert.equal(await page.textContent('#n-claimed'), '4');
+  assert.equal(await page.textContent('#n-claimed'), '5');
   assert.ok(await page.getByText('Counted - all parts approved').isVisible());
   assert.ok(await page.getByText('Denied - no attempts left').isVisible());
   if (process.env.SHOTS) { await page.setViewportSize({ width: 390, height: 860 }); await page.screenshot({ path: 'tmp/rider-grouped.png' }); }
@@ -216,13 +216,13 @@ test('rider: score at the top; claimed bonuses grouped, filtered and remembered'
   await page.fill('#search', '');
 
   await page.getByRole('tab', { name: /Claimed/ }).click();
-  assert.deepEqual(await codes(), ['WXYZ', 'ARSN', 'PEND', 'DEAD']);
+  assert.deepEqual(await codes(), ['WXYZ', 'ARSN', 'PEND', 'DENY', 'DEAD']);
 
   // Choice is remembered on the phone
   await page.reload();
   await page.getByText('Rider 42 - Jane Smith').waitFor();
   assert.equal(await page.getAttribute('#filter-tabs [data-filter="claimed"]', 'aria-selected'), 'true');
-  assert.deepEqual(await codes(), ['WXYZ', 'ARSN', 'PEND', 'DEAD']);
+  assert.deepEqual(await codes(), ['WXYZ', 'ARSN', 'PEND', 'DENY', 'DEAD']);
 
   // A combo that already counts cannot be sent again
   await page.getByRole('button', { name: /ARSN/ }).click();
