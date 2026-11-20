@@ -10,11 +10,11 @@
 <main id="app">
   <p class="muted">Loading...</p>
 </main>
-<dialog id="zoom"><img alt="Claim photo"><form method="dialog"><button class="secondary">Close</button></form></dialog>
+<dialog id="claim-dlg" class="compare" aria-label="Claim"></dialog>
 
 <script type="module">
 import { sb, $, esc, fmtTime, errorText, showMessage, setupBanner, currentScorer, renderLogin,
-         navBar, wireSignOut, shrinkImage, newId, BUCKET, sortableTable, remember, keep } from './lib.js';
+         navBar, wireSignOut, shrinkImage, newId, BUCKET, sortableTable, remember, keep, refPhotoUrl } from './lib.js';
 setupBanner();
 
 const app = $('#app');
@@ -23,18 +23,19 @@ let view = remember('review_view', 'cards');   // 'cards' or 'table', remembered
 let bonuses = [];
 let timer = null;
 let tables = {};   // sortable tables for the Table view, one per tab
+let shown = {};    // claims on screen by id (with photo links), for the claim dialog
 
 async function start() {
   let who;
   try { who = await currentScorer(); } catch (e) { app.innerHTML = `<div class="msg error">${esc(errorText(e))}</div>`; return; }
   if (!who.session) { renderLogin(app, start); return; }
   if (!who.isScorer) {
-    app.innerHTML = `${navBar('scorer.html')}<div class="msg error">${esc(who.session.user.email)} is not on the scorer list.
+    app.innerHTML = `${navBar('scorer.html', who)}<div class="msg error">${esc(who.session.user.email)} is not on the scorer list.
       Ask the organizer to add it.</div>`;
     wireSignOut();
     return;
   }
-  app.innerHTML = `${navBar('scorer.html')}
+  app.innerHTML = `${navBar('scorer.html', who)}
     <h1>Review claims</h1>
     <div class="tabs">
       <button type="button" data-tab="pending">Pending <span id="pending-count"></span></button>
@@ -66,20 +67,20 @@ async function start() {
   setInterval(() => { if (!document.hidden && tab === 'pending' && !typingReason()) render(); }, 20000);
 }
 
-const typingReason = () => [...document.querySelectorAll('[data-reason]')]
+const typingReason = () => $('#claim-dlg').open || [...document.querySelectorAll('[data-reason]')]
   .some((el) => el.value.trim() || el === document.activeElement);
 
 // Table view: one dense row per claim, sortable by any header. Uses the same data-act / data-reason /
-// data-zoom attributes as the cards, so Approve, Deny, Revert and photo zoom work the same way.
+// data-open attributes as the cards, so Approve, Deny, Revert and the claim dialog work the same way.
 function makeTables() {
   const time = (k) => ({ value: (r) => (r[k] ? new Date(r[k]).getTime() : null), cell: (r) => esc(fmtTime(r[k])) });
   const photo = { key: 'photo', label: 'Photo', nosort: true, cell: (r) => (r.url
-    ? `<img class="thumb" src="${esc(r.url)}" data-zoom="${esc(r.url)}" alt="Photo for ${esc(r.bonus_code)}">`
+    ? `<img class="thumb" src="${esc(r.url)}" data-open="${esc(r.id)}" alt="Photo for ${esc(r.bonus_code)}">`
     : `<span class="muted">${r.bonus_is_combo ? 'combo' : 'none'}</span>`) };
   const rider = { key: 'rider_number', label: 'Rider', num: true };
   const name = { key: 'rider_name', label: 'Name' };
   const bonus = { key: 'bonus_code', label: 'Bonus',
-    cell: (r) => `<span class="bonus-code">${esc(r.bonus_code)}</span> ${esc(r.bonus_name || '')}${r.bonus_is_combo ? ' <span class="muted">(combo)</span>' : ''}` };
+    cell: (r) => `<button type="button" class="link open-claim" data-open="${esc(r.id)}"><span class="bonus-code">${esc(r.bonus_code)}</span> ${esc(r.bonus_name || '')}</button>${r.bonus_is_combo ? ' <span class="muted">(combo)</span>' : ''}` };
   const points = { key: 'points', label: 'Points', num: true, desc: true };
   tables.pending = sortableTable($('#table-pending'), [
     photo,
@@ -143,6 +144,7 @@ async function render() {
   if (error) { showMessage($('#msg'), errorText(error), 'error'); return; }
   showMessage($('#msg'), '');
   const urls = await signedUrls(data);
+  shown = Object.fromEntries(data.map((c) => [c.id, { ...c, url: urls[c.photo_path], refUrl: refPhotoUrl(c.bonus_ref_photo) }]));
   if (tableMode) {
     // Only one view holds the action inputs at a time, so data-reason lookups stay unique
     $('#body').innerHTML = tab === 'decided' && data.length === 100
@@ -160,44 +162,89 @@ async function render() {
 
 function claimCard(c, url) {
   const photo = url
-    ? `<img src="${esc(url)}" data-zoom="${esc(url)}" alt="Photo for ${esc(c.bonus_code)}">`
+    ? `<img src="${esc(url)}" data-open="${esc(c.id)}" alt="Photo for ${esc(c.bonus_code)}">`
     : `<div class="nophoto">${c.bonus_is_combo ? 'Combo - no photo needed' : 'No photo'}</div>`;
-  const decided = c.status !== 'pending'
-    ? `<p><span class="badge ${c.status}">${c.status}</span> by ${esc(c.decided_by)} at ${esc(fmtTime(c.decided_at))}
-       ${c.reason ? `<br><span class="muted">Reason: ${esc(c.reason)}</span>` : ''}</p>` : '';
-  const actions = c.status === 'pending'
-    ? `<div class="row">
-         <button type="button" class="ok" data-act="approved" data-id="${c.id}">Approve</button>
-         <input type="text" class="grow" placeholder="Reason to deny (rider sees it)" data-reason="${c.id}" maxlength="500">
-         <button type="button" class="danger" data-act="denied" data-id="${c.id}">Deny</button>
-       </div>`
-    : `<button type="button" class="secondary" data-act="pending" data-id="${c.id}">Revert to pending</button>`;
+  const decided = decidedLine(c);
   return `<div class="card claim">
     ${photo}
     <div class="stack">
-      <div><h2><span class="bonus-code">${esc(c.bonus_code)}</span> ${esc(c.bonus_name || '')}
+      <div><h2><button type="button" class="link open-claim" data-open="${esc(c.id)}"><span class="bonus-code">${esc(c.bonus_code)}</span> ${esc(c.bonus_name || '')}</button>
         <span class="muted">${esc(c.points)} pts${c.bonus_is_combo ? ' - combo' : ''}</span></h2>
         <p>Rider <strong>${esc(c.rider_number)}</strong> - ${esc(c.rider_name)}</p>
         <p class="muted">Submitted ${esc(fmtTime(c.submitted_at))} by ${esc(c.submitted_by)}
           ${c.taken_at ? `- photo file time ${esc(fmtTime(c.taken_at))}` : ''}</p>
         ${c.note ? `<p>Note: ${esc(c.note)}</p>` : ''}
         ${decided}</div>
-      ${actions}
+      ${claimActions(c)}
     </div></div>`;
 }
 
+function decidedLine(c) {
+  return c.status !== 'pending'
+    ? `<p><span class="badge ${esc(c.status)}">${esc(c.status)}</span> by ${esc(c.decided_by)} at ${esc(fmtTime(c.decided_at))}
+       ${c.reason ? `<br><span class="muted">Reason: ${esc(c.reason)}</span>` : ''}</p>` : '';
+}
+
+function claimActions(c) {
+  return c.status === 'pending'
+    ? `<div class="row">
+         <button type="button" class="ok" data-act="approved" data-id="${esc(c.id)}">Approve</button>
+         <input type="text" class="grow" placeholder="Reason to deny (rider sees it)" data-reason="${esc(c.id)}" maxlength="500">
+         <button type="button" class="danger" data-act="denied" data-id="${esc(c.id)}">Deny</button>
+       </div>`
+    : `<button type="button" class="secondary" data-act="pending" data-id="${esc(c.id)}">Revert to pending</button>`;
+}
+
+// Claim dialog: the rider's photo next to the bonus reference photo, with the same decide buttons
+function openClaimDialog(id) {
+  const c = shown[id];
+  if (!c) return;
+  const figure = (title, url, none) => `<figure>
+      <figcaption>${title}</figcaption>
+      ${url ? `<a href="${esc(url)}" target="_blank" rel="noopener"><img src="${esc(url)}" alt="${title} for ${esc(c.bonus_code)}"></a>`
+        : `<div class="nophoto">${none}</div>`}</figure>`;
+  const dlg = $('#claim-dlg');
+  dlg.innerHTML = `<div class="stack">
+      <div class="row"><h2 class="grow"><span class="bonus-code">${esc(c.bonus_code)}</span> ${esc(c.bonus_name || '')}
+          <span class="muted">${esc(c.points)} pts${c.bonus_is_combo ? ' - combo' : ''}</span></h2>
+        <button type="button" class="secondary" id="dlg-close">Close</button></div>
+      <p>Rider <strong>${esc(c.rider_number)}</strong> - ${esc(c.rider_name)}
+        <span class="muted">- submitted ${esc(fmtTime(c.submitted_at))} by ${esc(c.submitted_by)}
+        ${c.taken_at ? `- photo file time ${esc(fmtTime(c.taken_at))}` : ''}</span></p>
+      ${c.note ? `<p>Note: ${esc(c.note)}</p>` : ''}
+      <div class="compare-photos">
+        ${figure('Submitted photo', c.url, c.bonus_is_combo ? 'Combo - no photo needed' : 'No photo')}
+        ${figure('Reference photo', c.refUrl, 'No reference photo for this bonus. An admin can add one.')}
+      </div>
+      ${decidedLine(c)}
+      ${claimActions(c)}
+    </div>`;
+  $('#dlg-close').addEventListener('click', () => dlg.close());
+  if (!dlg.open) dlg.showModal();
+}
+
 document.addEventListener('click', async (ev) => {
-  const z = ev.target.closest('[data-zoom]');
-  if (z) { const d = $('#zoom'); $('img', d).src = z.dataset.zoom; d.showModal(); return; }
+  const o = ev.target.closest('[data-open]');
+  if (o) { openClaimDialog(o.dataset.open); return; }
   const b = ev.target.closest('[data-act]');
   if (!b) return;
   const status = b.dataset.act;
-  const reasonEl = document.querySelector(`[data-reason="${b.dataset.id}"]`);
+  // The reason box next to this button (card, table row or dialog all use the same markup)
+  const dlg = $('#claim-dlg');
+  const inDialog = dlg.contains(b);
+  const reasonEl = (b.closest('dialog, .claim, tr') || document).querySelector(`[data-reason="${b.dataset.id}"]`);
   const reason = reasonEl ? reasonEl.value.trim() : '';
-  if (status === 'denied' && !reason) { reasonEl.focus(); showMessage($('#msg'), 'Enter a reason to deny.', 'warn'); return; }
+  const say = (text, kind) => {
+    if (!inDialog) return showMessage($('#msg'), text, kind);
+    let m = $('.msg', dlg);
+    if (!m) { m = document.createElement('div'); m.className = 'msg'; dlg.firstElementChild.append(m); }
+    showMessage(m, text, kind);
+  };
+  if (status === 'denied' && !reason) { reasonEl.focus(); say('Enter a reason to deny.', 'warn'); return; }
   b.disabled = true;
   const { error } = await sb.rpc('scorer_decide', { p_claim_id: b.dataset.id, p_status: status, p_reason: reason || null });
-  if (error) { showMessage($('#msg'), errorText(error), 'error'); b.disabled = false; return; }
+  if (error) { say(errorText(error), 'error'); b.disabled = false; return; }
+  if (inDialog) dlg.close();
   render();
 });
 

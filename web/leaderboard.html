@@ -8,6 +8,7 @@
 </head>
 <body>
 <main>
+  <div id="nav"></div>
   <h1>Leader board</h1>
   <p class="muted" id="updated">Loading...</p>
   <div id="msg" class="msg" hidden></div>
@@ -19,8 +20,15 @@
   </div>
 </main>
 <script type="module">
-import { sb, $, esc, errorText, showMessage, setupBanner } from './lib.js';
+import { sb, $, esc, errorText, showMessage, setupBanner, currentScorer, navBar, wireSignOut } from './lib.js';
 setupBanner();
+
+// Signed-in scorers and admins get their page links; everyone else just sees the board
+currentScorer().then((who) => {
+  if (!who.isScorer) return;
+  $('#nav').innerHTML = navBar('leaderboard.html', who);
+  wireSignOut();
+}).catch(() => { /* board still works without the links */ });
 
 async function load() {
   const { data, error } = await sb.rpc('leaderboard');

@@ -8,10 +8,12 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
 </head>
 <body>
-<main id="app"><p class="muted">Loading...</p></main>
+<main id="app" class="wide"><p class="muted">Loading...</p></main>
+<dialog id="edit" class="editor"></dialog>
 
 <script type="module">
-import { sb, $, esc, errorText, showMessage, setupBanner, currentScorer, renderLogin, navBar, wireSignOut } from './lib.js';
+import { sb, $, esc, errorText, showMessage, setupBanner, currentScorer, renderLogin, navBar, wireSignOut,
+         sortableTable, shrinkImage, newId, REF_BUCKET, refPhotoUrl } from './lib.js';
 setupBanner();
 const app = $('#app');
 
@@ -40,9 +42,15 @@ async function start() {
   let who;
   try { who = await currentScorer(); } catch (e) { app.innerHTML = `<div class="msg error">${esc(errorText(e))}</div>`; return; }
   if (!who.session) { renderLogin(app, start); return; }
-  if (!who.isScorer) { app.innerHTML = `${navBar('admin.html')}<div class="msg error">Not on the scorer list.</div>`; wireSignOut(); return; }
+  if (!who.isAdmin) {
+    app.innerHTML = `${navBar('admin.html', who)}<div class="msg error">${who.isScorer
+      ? 'The admin page is for rally admins only. You can review claims on the Review page.'
+      : `${esc(who.session.user.email)} is not on the scorer list.`}</div>`;
+    wireSignOut();
+    return;
+  }
 
-  app.innerHTML = `${navBar('admin.html')}
+  app.innerHTML = `${navBar('admin.html', who)}
     <h1>Admin</h1>
     <div class="card"><h2>Event</h2>
       <form id="settings" class="stack">
@@ -65,30 +73,56 @@ async function start() {
         </div>`).join('')}
     </div>
 
-    <div class="card"><h2>Rider links</h2>
+    <div class="card"><h2>Riders</h2>
       <p class="muted">Each rider opens their own link. Send it by text or email, or print it as a QR code in the rider packet.
         "New link" makes the old one stop working.</p>
-      <div class="row"><button type="button" id="dl-links" class="secondary">Download links as CSV</button></div>
-      <div class="table-wrap"><table><thead><tr><th>#</th><th>Name</th><th>Link</th><th></th></tr></thead>
-        <tbody id="links"></tbody></table></div>
+      <div class="row"><button type="button" data-add="rider">Add rider</button>
+        <button type="button" id="dl-links" class="secondary">Download links as CSV</button></div>
+      <div id="riders-msg" class="msg" hidden></div>
+      <div id="riders"></div>
     </div>
 
-    <div class="card"><h2>Testing reset</h2>
-      <p class="muted">Deletes every claim and its history. Riders, bonuses and links are kept. Photos stay in storage.</p>
-      <div class="row"><input type="text" id="del-confirm" class="grow" placeholder="Type DELETE ALL CLAIMS">
-        <button type="button" class="danger" id="del-btn">Delete all claims</button></div>
+    <div class="card"><h2>Bonuses</h2>
+      <p class="muted">Penalties are bonuses with negative points. A reference photo shows riders and scorers what
+        the bonus looks like.</p>
+      <div class="row"><button type="button" data-add="bonus">Add bonus</button></div>
+      <div id="bonuses-msg" class="msg" hidden></div>
+      <div id="bonuses"></div>
+    </div>
+
+    <div class="card"><h2>Combos</h2>
+      <p class="muted">A combo is a bonus that also counts when every bonus in it is approved. Add the combo
+        as a bonus first, then list its bonuses here.</p>
+      <div class="row"><button type="button" data-add="combo">Add combo</button></div>
+      <div id="combos-msg" class="msg" hidden></div>
+      <div id="combos"></div>
+    </div>
+
+    <div class="card"><h2>Delete</h2>
+      <p class="muted">For testing, or to start a new event. This cannot be undone. Photos stay in storage.</p>
+      <div class="row">
+        <select id="del-what" class="grow">
+          ${Object.entries(DELETES).map(([k, d]) => `<option value="${k}">${esc(d.label)}</option>`).join('')}
+        </select>
+      </div>
+      <p class="muted" id="del-help"></p>
+      <div class="row"><input type="text" id="del-confirm" class="grow">
+        <button type="button" class="danger" id="del-btn">Delete</button></div>
       <div id="del-msg" class="msg" hidden></div>
     </div>`;
   wireSignOut();
+  makeTables();
   await loadSettings();
-  await loadLinks();
+  await loadAll();
 
   $('#settings').addEventListener('submit', saveSettings);
   app.querySelectorAll('[data-kind]').forEach((inp) => inp.addEventListener('change', () => preview(inp.dataset.kind, inp.files[0])));
   app.querySelectorAll('[data-import]').forEach((b) => b.addEventListener('click', () => doImport(b.dataset.import, b)));
   $('#dl-links').addEventListener('click', downloadLinks);
-  $('#links').addEventListener('click', newLink);
-  $('#del-btn').addEventListener('click', deleteClaims);
+  app.addEventListener('click', onListClick);
+  $('#del-what').addEventListener('change', showDeleteHelp);
+  $('#del-btn').addEventListener('click', deleteAll);
+  showDeleteHelp();
 }
 
 async function loadSettings() {
@@ -202,21 +236,72 @@ async function doImport(kind, btn) {
   box.innerHTML = error ? `<div class="msg error">${esc(errorText(error))}</div>`
     : `<div class="msg ok">Imported ${rows.length} ${kind}.</div>`;
   parsed[kind] = null;
-  if (kind === 'riders') loadLinks();
+  if (!error) loadAll();
 }
 
-// ---- Rider links ----
+// ---- Riders, bonuses, combos: lists ----
 let riders = [];
+let bonuses = [];
+let combos = [];   // [{ combo_code, members: [...] }]
+const tables = {};
 const linkFor = (t) => new URL(`rider.html?t=${t}`, location.href).href;
+const CODE_RE = /^([A-Z]{4}|[A-Z]{3}[0-9])$/;
 
-async function loadLinks() {
-  const { data, error } = await sb.from('riders').select('rider_number,name,email,token').order('rider_number');
-  if (error) { $('#links').innerHTML = `<tr><td colspan="4">${esc(errorText(error))}</td></tr>`; return; }
-  riders = data;
-  $('#links').innerHTML = data.map((r) => `<tr><td>${esc(r.rider_number)}</td><td>${esc(r.name)}</td>
-    <td><a href="${esc(linkFor(r.token))}" target="_blank" rel="noopener">open</a></td>
-    <td><button type="button" class="link" data-newlink="${esc(r.rider_number)}">New link</button></td></tr>`).join('')
-    || '<tr><td colspan="4" class="muted">Import riders first.</td></tr>';
+function makeTables() {
+  const btn = (attrs, label, cls = 'link') => `<button type="button" class="${cls}" ${attrs}>${label}</button>`;
+  tables.riders = sortableTable($('#riders'), [
+    { key: 'rider_number', label: '#', num: true },
+    { key: 'name', label: 'Name' },
+    { key: 'email', label: 'Email' },
+    { key: 'link', label: 'Link', nosort: true, cell: (r) => `<a href="${esc(linkFor(r.token))}" target="_blank" rel="noopener">open</a>` },
+    { key: 'actions', label: '', nosort: true, cell: (r) => `<div class="row-actions">
+        ${btn(`data-edit-rider="${esc(r.id)}"`, 'Edit')}${btn(`data-newlink="${esc(r.rider_number)}"`, 'New link')}
+        ${btn(`data-del-rider="${esc(r.id)}"`, 'Delete')}</div>` },
+  ], { sort: { key: 'rider_number', dir: 'asc' }, store: 'admin_sort_riders', empty: 'No riders yet. Import or add them.' });
+
+  tables.bonuses = sortableTable($('#bonuses'), [
+    { key: 'ref_photo_path', label: 'Photo', nosort: true, cell: (b) => (b.ref_photo_path
+      ? `<a href="${esc(refPhotoUrl(b.ref_photo_path))}" target="_blank" rel="noopener"><img class="thumb" src="${esc(refPhotoUrl(b.ref_photo_path))}" alt="Reference photo for ${esc(b.code)}"></a>`
+      : '<span class="muted">none</span>') },
+    { key: 'code', label: 'Code', cell: (b) => `<span class="bonus-code">${esc(b.code)}</span>` },
+    { key: 'name', label: 'Name' },
+    { key: 'points', label: 'Points', num: true, desc: true },
+    { key: 'sort_order', label: 'Order', num: true },
+    { key: 'description', label: 'Description', cls: 'wrap' },
+    { key: 'actions', label: '', nosort: true, cell: (b) => `<div class="row-actions">
+        ${btn(`data-edit-bonus="${esc(b.code)}"`, 'Edit')}${btn(`data-del-bonus="${esc(b.code)}"`, 'Delete')}</div>` },
+  ], { sort: { key: 'sort_order', dir: 'asc' }, store: 'admin_sort_bonuses', empty: 'No bonuses yet. Import or add them.' });
+
+  tables.combos = sortableTable($('#combos'), [
+    { key: 'combo_code', label: 'Combo', cell: (c) => `<span class="bonus-code">${esc(c.combo_code)}</span>` },
+    { key: 'name', label: 'Name' },
+    { key: 'points', label: 'Points', num: true, desc: true },
+    { key: 'members', label: 'Bonuses in it', value: (c) => c.members.join(', '), cls: 'wrap' },
+    { key: 'actions', label: '', nosort: true, cell: (c) => `<div class="row-actions">
+        ${btn(`data-edit-combo="${esc(c.combo_code)}"`, 'Edit')}${btn(`data-del-combo="${esc(c.combo_code)}"`, 'Delete')}</div>` },
+  ], { sort: { key: 'combo_code', dir: 'asc' }, store: 'admin_sort_combos', empty: 'No combos yet.' });
+}
+
+async function loadAll() {
+  const [r, b, m] = await Promise.all([
+    sb.from('riders').select('id,rider_number,name,email,token').order('rider_number'),
+    sb.from('bonuses').select('*').order('sort_order', { nullsFirst: false }).order('code'),
+    sb.from('combo_members').select('*').order('combo_code').order('member_code'),
+  ]);
+  for (const [res, el] of [[r, '#riders-msg'], [b, '#bonuses-msg'], [m, '#combos-msg']]) {
+    showMessage($(el), res.error ? errorText(res.error) : '', 'error');
+  }
+  riders = r.data || [];
+  bonuses = b.data || [];
+  const byCombo = {};
+  for (const x of m.data || []) (byCombo[x.combo_code] ||= []).push(x.member_code);
+  combos = Object.entries(byCombo).map(([code, members]) => {
+    const bonus = bonuses.find((x) => x.code === code) || {};
+    return { combo_code: code, name: bonus.name, points: bonus.points, members };
+  });
+  tables.riders.set(riders);
+  tables.bonuses.set(bonuses);
+  tables.combos.set(combos);
 }
 
 function downloadLinks() {
@@ -228,18 +313,182 @@ function downloadLinks() {
   a.click();
 }
 
-async function newLink(ev) {
-  const b = ev.target.closest('[data-newlink]');
-  if (!b) return;
-  b.disabled = true;
-  const { error } = await sb.rpc('scorer_new_token', { p_rider_number: Number(b.dataset.newlink) });
-  if (error) { b.textContent = errorText(error); return; }
-  loadLinks();
+// Postgres errors in words an organizer can act on
+function saveError(err, what) {
+  if (err?.code === '23505') return `${what} is already used.`;
+  if (err?.code === '23503') return `${what} has claims, so it cannot be deleted. Delete its claims first (Delete -> All claims).`;
+  return errorText(err);
 }
 
-async function deleteClaims() {
-  const { data, error } = await sb.rpc('scorer_delete_all_claims', { p_confirm: $('#del-confirm').value.trim() });
-  showMessage($('#del-msg'), error ? errorText(error) : `Deleted ${data} claims.`, error ? 'error' : 'ok');
+async function onListClick(ev) {
+  const t = ev.target.closest('button');
+  if (!t || !app.contains(t)) return;
+  const d = t.dataset;
+  if (d.add === 'rider') return editRider(null);
+  if (d.add === 'bonus') return editBonus(null);
+  if (d.add === 'combo') return editCombo(null);
+  if (d.editRider) return editRider(riders.find((r) => String(r.id) === d.editRider));
+  if (d.editBonus) return editBonus(bonuses.find((b) => b.code === d.editBonus));
+  if (d.editCombo) return editCombo(combos.find((c) => c.combo_code === d.editCombo));
+  if (d.newlink) {
+    if (!confirm(`Make a new link for rider ${d.newlink}? Their old link stops working.`)) return;
+    t.disabled = true;
+    const { error } = await sb.rpc('scorer_new_token', { p_rider_number: Number(d.newlink) });
+    if (error) { showMessage($('#riders-msg'), errorText(error), 'error'); t.disabled = false; return; }
+    await loadAll();
+    return showMessage($('#riders-msg'), `Rider ${d.newlink} has a new link.`, 'ok');
+  }
+  if (d.delRider) {
+    const r = riders.find((x) => String(x.id) === d.delRider);
+    if (!confirm(`Delete rider ${r.rider_number} ${r.name} and all of their claims?`)) return;
+    const { error } = await sb.from('riders').delete().eq('id', r.id);
+    await loadAll();
+    return showMessage($('#riders-msg'), error ? errorText(error) : `Deleted rider ${r.rider_number}.`, error ? 'error' : 'ok');
+  }
+  if (d.delBonus) {
+    const b = bonuses.find((x) => x.code === d.delBonus);
+    if (!confirm(`Delete bonus ${b.code}?${combos.some((c) => c.members.includes(b.code) || c.combo_code === b.code) ? ' It is also removed from its combos.' : ''}`)) return;
+    const { error } = await sb.from('bonuses').delete().eq('code', b.code);
+    if (!error && b.ref_photo_path) await sb.storage.from(REF_BUCKET).remove([b.ref_photo_path]);
+    await loadAll();
+    return showMessage($('#bonuses-msg'), error ? saveError(error, `Bonus ${b.code}`) : `Deleted bonus ${b.code}.`, error ? 'error' : 'ok');
+  }
+  if (d.delCombo) {
+    if (!confirm(`Remove combo ${d.delCombo}? The bonus ${d.delCombo} itself stays.`)) return;
+    const { error } = await sb.rpc('admin_set_combo', { p_combo: d.delCombo, p_members: [] });
+    await loadAll();
+    return showMessage($('#combos-msg'), error ? errorText(error) : `Removed combo ${d.delCombo}.`, error ? 'error' : 'ok');
+  }
+}
+
+// ---- Edit dialog (one form at a time) ----
+// fields: [{ id, label, type, value, required, readonly, attrs, help }]; onSave(values) -> error text or ''
+function openEditor(title, fields, onSave, extra = '') {
+  const dlg = $('#edit');
+  dlg.innerHTML = `<form class="stack" id="edit-form">
+      <h2>${esc(title)}</h2>
+      ${fields.map((f) => `<label class="stack"><span>${esc(f.label)}</span>
+        ${f.type === 'textarea'
+          ? `<textarea id="f-${f.id}" ${f.attrs || ''}>${esc(f.value)}</textarea>`
+          : `<input type="${f.type || 'text'}" id="f-${f.id}" value="${esc(f.value)}" ${f.required ? 'required' : ''} ${f.readonly ? 'readonly' : ''} ${f.attrs || ''}>`}
+        ${f.help ? `<span class="muted">${esc(f.help)}</span>` : ''}</label>`).join('')}
+      ${extra}
+      <div id="edit-msg" class="msg" hidden></div>
+      <div class="row"><button type="submit">Save</button>
+        <button type="button" class="secondary" id="edit-cancel">Cancel</button></div>
+    </form>`;
+  $('#edit-cancel').addEventListener('click', () => dlg.close());
+  $('#edit-form').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const values = Object.fromEntries(fields.map((f) => [f.id, $(`#f-${f.id}`).value.trim()]));
+    const btn = ev.submitter || $('#edit-form button[type="submit"]');
+    btn.disabled = true;
+    showMessage($('#edit-msg'), 'Saving...');
+    let err;
+    try { err = await onSave(values); } catch (e) { err = errorText(e); }
+    btn.disabled = false;
+    if (err) { showMessage($('#edit-msg'), err, 'error'); return; }
+    dlg.close();
+    await loadAll();
+  });
+  dlg.showModal();
+}
+
+function editRider(r) {
+  openEditor(r ? `Rider ${r.rider_number}` : 'Add rider', [
+    { id: 'number', label: 'Rider number', type: 'number', value: r?.rider_number ?? '', required: true, attrs: 'min="1"' },
+    { id: 'name', label: 'Name', value: r?.name ?? '', required: true },
+    { id: 'email', label: 'Email (optional)', type: 'email', value: r?.email ?? '' },
+  ], async (v) => {
+    const row = { rider_number: Number(v.number), name: v.name, email: v.email ? v.email.toLowerCase() : null };
+    if (!Number.isInteger(row.rider_number) || row.rider_number <= 0) return 'Rider number must be a whole number above 0.';
+    if (!row.name) return 'Enter a name.';
+    const { error } = r ? await sb.from('riders').update(row).eq('id', r.id) : await sb.from('riders').insert(row);
+    return error ? saveError(error, `Rider number ${row.rider_number}`) : '';
+  });
+}
+
+function editBonus(b) {
+  const photo = b?.ref_photo_path
+    ? `<img class="photo-preview" src="${esc(refPhotoUrl(b.ref_photo_path))}" alt="Current reference photo">
+       <label class="check"><input type="checkbox" id="f-photo-remove"> Remove the reference photo</label>`
+    : '';
+  openEditor(b ? `Bonus ${b.code}` : 'Add bonus', [
+    { id: 'code', label: 'Code', value: b?.code ?? '', required: true, readonly: !!b, attrs: 'maxlength="4" autocapitalize="characters"',
+      help: b ? 'The code cannot be changed. Delete the bonus and add it again instead.' : '4 letters, or 3 letters and a digit.' },
+    { id: 'name', label: 'Name', value: b?.name ?? '' },
+    { id: 'points', label: 'Points', type: 'number', value: b?.points ?? '', required: true, help: 'Negative = percent penalty, e.g. -25.' },
+    { id: 'sort_order', label: 'Order in the rider list (optional)', type: 'number', value: b?.sort_order ?? '' },
+    { id: 'description', label: 'Description', type: 'textarea', value: b?.description ?? '' },
+  ], async (v) => {
+    const code = v.code.toUpperCase();
+    if (!CODE_RE.test(code)) return `"${code}" is not 4 letters or 3 letters + 1 digit.`;
+    if (!/^-?\d+$/.test(v.points)) return 'Points must be a whole number.';
+    if (v.sort_order && !/^-?\d+$/.test(v.sort_order)) return 'Order must be a whole number.';
+    const row = { name: v.name || null, points: Number(v.points), description: v.description || null,
+      sort_order: v.sort_order === '' ? null : Number(v.sort_order) };
+    const old = b?.ref_photo_path || null;
+    const file = $('#f-photo').files[0];
+    if (file) {
+      showMessage($('#edit-msg'), 'Uploading photo...');
+      const img = await shrinkImage(file);
+      const path = `${code}/${newId()}.${img.ext}`;
+      const { error } = await sb.storage.from(REF_BUCKET).upload(path, img.blob, { contentType: img.type });
+      if (error) return errorText(error);
+      row.ref_photo_path = path;
+    } else if ($('#f-photo-remove')?.checked) {
+      row.ref_photo_path = null;
+    }
+    const { error } = b ? await sb.from('bonuses').update(row).eq('code', code)
+      : await sb.from('bonuses').insert({ code, ...row });
+    if (error) return saveError(error, `Bonus ${code}`);
+    if (old && 'ref_photo_path' in row) await sb.storage.from(REF_BUCKET).remove([old]);   // replaced or removed
+    return '';
+  }, `<label class="stack"><span>Reference photo${b?.ref_photo_path ? ' (choose a file to replace it)' : ' (optional)'}</span>
+      <input type="file" id="f-photo" accept="image/*"></label>${photo}`);
+}
+
+function editCombo(c) {
+  const options = bonuses.filter((b) => b.points >= 0).map((b) => b.code);
+  openEditor(c ? `Combo ${c.combo_code}` : 'Add combo', [
+    { id: 'combo', label: 'Combo bonus code', value: c?.combo_code ?? '', required: true, readonly: !!c,
+      attrs: 'maxlength="4" autocapitalize="characters" list="bonus-codes"', help: 'The combo must already be a bonus (it has its own points).' },
+    { id: 'members', label: 'Bonuses in the combo', value: c ? c.members.join(', ') : '', required: true,
+      attrs: 'autocapitalize="characters"', help: 'Bonus codes separated by commas or spaces, e.g. ABCD, WXYZ.' },
+  ], async (v) => {
+    const members = v.members.toUpperCase().split(/[\s,;]+/).filter(Boolean);
+    const { error } = await sb.rpc('admin_set_combo', { p_combo: v.combo.toUpperCase(), p_members: members });
+    return error ? errorText(error) : '';
+  }, `<datalist id="bonus-codes">${options.map((o) => `<option value="${esc(o)}">`).join('')}</datalist>`);
+}
+
+// ---- Delete everything of one kind ----
+const DELETES = {
+  claims: { label: 'All claims', phrase: 'DELETE ALL CLAIMS', help: 'Deletes every claim and its history. Riders, bonuses and links are kept.' },
+  riders: { label: 'All riders', phrase: 'DELETE ALL RIDERS', help: 'Deletes every rider, their links and all of their claims.' },
+  bonuses: { label: 'All bonuses', phrase: 'DELETE ALL BONUSES', help: 'Deletes every bonus, every combo and every claim. Riders are kept.' },
+  combos: { label: 'All combos', phrase: 'DELETE ALL COMBOS', help: 'Removes which bonuses make up each combo. The combo bonuses themselves stay.' },
+};
+
+function showDeleteHelp() {
+  const d = DELETES[$('#del-what').value];
+  $('#del-help').textContent = d.help;
+  $('#del-confirm').placeholder = `Type ${d.phrase}`;
+  $('#del-confirm').value = '';
+  $('#del-btn').textContent = `Delete ${d.label.toLowerCase()}`;
+  showMessage($('#del-msg'), '');
+}
+
+async function deleteAll() {
+  const what = $('#del-what').value;
+  const confirmText = $('#del-confirm').value.trim();
+  const { data, error } = what === 'claims'
+    ? await sb.rpc('scorer_delete_all_claims', { p_confirm: confirmText })
+    : await sb.rpc('admin_delete_all', { p_what: what, p_confirm: confirmText });
+  const [one, many] = { claims: ['claim', 'claims'], riders: ['rider', 'riders'], bonuses: ['bonus', 'bonuses'],
+    combos: ['combo entry', 'combo entries'] }[what];
+  showMessage($('#del-msg'), error ? errorText(error) : `Deleted ${data} ${data === 1 ? one : many}.`, error ? 'error' : 'ok');
+  if (!error) { $('#del-confirm').value = ''; await loadAll(); }
 }
 
 start();

@@ -76,6 +76,21 @@ async function newPage(handlers, { session = false } = {}) {
   return { page, calls, errors, ctx };
 }
 
+// A 1x1 PNG, served for photo links
+const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', 'base64');
+const servePng = (_c, r) => { r.fulfill({ contentType: 'image/png', body: PNG, headers: { 'access-control-allow-origin': '*' } }); return 'handled'; };
+const navLinks = (page) => page.$$eval('nav.nav a', (els) => els.map((e) => e.textContent));
+
+// Wait until the page has made a matching API call
+async function callMade(page, calls, pred) {
+  for (let i = 0; i < 100; i++) {
+    const c = calls.find(pred);
+    if (c) return c;
+    await page.waitForTimeout(50);
+  }
+  throw new Error('expected API call was not made');
+}
+
 // A big, real JPEG made by the browser itself
 async function bigJpeg() {
   const p = await browser.newPage();
@@ -94,7 +109,7 @@ const session = () => ({
   rider: { number: 42, name: 'Jane Smith' },
   score: { total: 50, base_points: 50, worst_penalty: null, bonuses_counted: 1 },
   bonuses: [
-    { code: 'ABCD', name: 'Old mill', points: 100, description: 'Photo of the wheel', is_combo: false, attempts: 0, status: null, counted: false },
+    { code: 'ABCD', name: 'Old mill', points: 100, description: 'Photo of the wheel', is_combo: false, attempts: 0, status: null, counted: false, ref_photo: 'ABCD/ref.jpg' },
     { code: 'WXYZ', name: 'Covered bridge', points: 50, is_combo: false, attempts: 1, status: 'approved', counted: true },
     { code: 'ARSN', name: 'Mill + bridge', points: 25, is_combo: true, attempts: 0, status: null, counted: false },
   ],
@@ -232,7 +247,6 @@ test('rider: score at the top; claimed bonuses grouped, filtered and remembered'
 });
 
 test('rider: sees past submissions with the reason, and their photo on tap', async () => {
-  const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', 'base64');
   const sess = session();
   sess.bonuses[0] = { ...sess.bonuses[0], attempts: 2, status: 'denied', history: [
     { status: 'denied', submitted_at: new Date().toISOString(), photo_path: `${TOKEN}/b.jpg`, reason: 'flag not visible', by_staff: false },
@@ -287,7 +301,7 @@ test('rider: photo viewer explains a failure and lets the rider retry', async ()
 
 test('scorer: sees pending claim with photo, deny needs a reason, approve calls the API', async () => {
   const { page, calls, errors } = await newPage({
-    'POST /rest/v1/rpc/is_scorer': () => ({ json: true }),
+    'POST /rest/v1/rpc/staff_role': () => ({ json: 'scorer' }),
     'GET /rest/v1/bonuses': () => ({ json: [{ code: 'ABCD', name: 'Old mill', points: 100 }] }),
     'HEAD /rest/v1/claims': () => ({ headers: { 'content-range': '0-0/1' } }),
     'GET /rest/v1/claims_detail': () => ({ json: [{
@@ -300,6 +314,7 @@ test('scorer: sees pending claim with photo, deny needs a reason, approve calls 
   await page.goto(`${APP}scorer.html`);
   await page.locator('.claim').getByText('Rider 42 - Jane Smith').waitFor();
   assert.ok(await page.getByText('Pending (1)').isVisible());
+  assert.deepEqual(await navLinks(page), ['Review', 'Activity', 'Leader board'], 'no Admin link for a scorer');
   assert.ok(await page.getByText('sign was behind a tree').isVisible());
   assert.match(await page.getAttribute('.claim img', 'src'), /object\/sign\/claims\/.*p\.jpg/);
 
@@ -322,7 +337,7 @@ test('scorer: table view is sortable, decides from the row, and is remembered', 
     rider_number: rider, rider_name: `Rider ${rider}`, submitted_at: new Date(now - minsAgo * 60000).toISOString(),
     submitted_by: `rider ${rider}`, photo_path: `${TOKEN}/${id}.jpg`, ...extra });
   const { page, calls, errors } = await newPage({
-    'POST /rest/v1/rpc/is_scorer': () => ({ json: true }),
+    'POST /rest/v1/rpc/staff_role': () => ({ json: 'scorer' }),
     'GET /rest/v1/bonuses': () => ({ json: [] }),
     'HEAD /rest/v1/claims': () => ({ headers: { 'content-range': '0-2/3' } }),
     'GET /rest/v1/claims_detail': () => ({ json: [
@@ -369,7 +384,7 @@ test('scorer: table view is sortable, decides from the row, and is remembered', 
 test('activity: tiles, claim feed, riders never seen, scorer sign-ins', async () => {
   const ago = (m) => new Date(Date.now() - m * 60000).toISOString();
   const { page, errors } = await newPage({
-    'POST /rest/v1/rpc/is_scorer': () => ({ json: true }),
+    'POST /rest/v1/rpc/staff_role': () => ({ json: 'admin' }),
     'GET /rest/v1/claim_activity': () => ({ json: [
       { id: 3, at: ago(2), action: 'approved', actor: 'scorer@example.com', rider_number: 42, rider_name: 'Jane Smith', bonus_code: 'ABCD', bonus_name: 'Old mill', points: 100 },
       { id: 2, at: ago(5), action: 'denied', actor: 'scorer@example.com', rider_number: 7, rider_name: 'Bob Jones', bonus_code: 'WXYZ', bonus_name: 'Covered bridge', points: 50, reason: 'wrong bridge' },
@@ -415,23 +430,24 @@ test('scorer: signed-out user gets the email login; non-scorer is told so', asyn
   await page.goto(`${APP}scorer.html`);
   await page.getByText('Scorer sign in').waitFor();
 
-  const other = await newPage({ 'POST /rest/v1/rpc/is_scorer': () => ({ json: false }) }, { session: true });
+  const other = await newPage({ 'POST /rest/v1/rpc/staff_role': () => ({ json: null }) }, { session: true });
   await other.page.goto(`${APP}scorer.html`);
   await other.page.getByText('is not on the scorer list').waitFor();
 });
 
 test('admin: CSV import validates, then upserts riders with the sheet column names', async () => {
   const { page, calls, errors } = await newPage({
-    'POST /rest/v1/rpc/is_scorer': () => ({ json: true }),
+    'POST /rest/v1/rpc/staff_role': () => ({ json: 'admin' }),
     'GET /rest/v1/settings': () => ({ json: { id: 1, event_name: 'SNAFU Test Rally', max_attempts: 3, claims_open: true } }),
     'GET /rest/v1/riders': () => ({ json: [{ rider_number: 42, name: 'Jane Smith', email: 'jane@example.com', token: TOKEN }] }),
     'POST /rest/v1/riders': () => ({ status: 201, json: [] }),
     'POST /rest/v1/bonuses': () => ({ status: 201, json: [] }),
   }, { session: true });
   await page.goto(`${APP}admin.html`);
-  await page.getByRole('heading', { name: 'Rider links' }).waitFor();
+  await page.locator('#riders tbody a').waitFor();
   assert.equal(await page.inputValue('#s-name'), 'SNAFU Test Rally');
-  assert.match(await page.getAttribute('#links a', 'href'), new RegExp(`rider\\.html\\?t=${TOKEN}$`));
+  assert.match(await page.getAttribute('#riders tbody a', 'href'), new RegExp(`rider\\.html\\?t=${TOKEN}$`));
+  assert.deepEqual(await navLinks(page), ['Review', 'Activity', 'Admin', 'Leader board']);
 
   const csv = 'Rider Number,Name,Email\n42,Jane Smith,JANE@example.com\n7,Bob Jones,\n\n';
   await page.setInputFiles('[data-kind="riders"]', { name: 'riders.csv', mimeType: 'text/csv', buffer: Buffer.from(csv) });
@@ -462,5 +478,165 @@ test('leader board renders scores', async () => {
   await page.goto(`${APP}leaderboard.html`);
   await page.getByText('131.25').waitFor();
   assert.ok(await page.getByText('Bob Jones').isVisible());
+  assert.deepEqual(await navLinks(page), [], 'the public sees no staff links');
+  assert.deepEqual(errors, []);
+
+  // A signed-in scorer gets links back to their pages
+  const signedIn = await newPage({
+    'POST /rest/v1/rpc/leaderboard': () => ({ json: [] }),
+    'POST /rest/v1/rpc/staff_role': () => ({ json: 'scorer' }),
+  }, { session: true });
+  await signedIn.page.goto(`${APP}leaderboard.html`);
+  await signedIn.page.locator('nav.nav').waitFor();
+  assert.deepEqual(await navLinks(signedIn.page), ['Review', 'Activity', 'Leader board']);
+});
+
+test('rider: reference photo shows on tap', async () => {
+  const { page, calls, errors } = await newPage({
+    'POST /rest/v1/rpc/rider_session': () => ({ json: session() }),
+    'GET /storage/v1/object/public/bonus-photos/': servePng,
+  });
+  await page.goto(`${APP}rider.html?t=${TOKEN}`);
+  await page.getByRole('button', { name: /WXYZ/ }).click();
+  assert.equal(await page.isVisible('#c-ref'), false, 'no button when the bonus has no reference photo');
+  await page.getByRole('button', { name: /All bonuses/ }).click();
+  await page.getByRole('button', { name: /ABCD/ }).click();
+  assert.equal(calls.filter((c) => c.key.includes('bonus-photos')).length, 0, 'nothing downloaded before the tap');
+  await page.getByRole('button', { name: 'Show reference photo' }).click();
+  await page.waitForFunction(() => document.querySelector('#c-ref-img').naturalWidth > 0);
+  assert.equal(await page.getAttribute('#c-ref-img', 'src'), `${API}/storage/v1/object/public/bonus-photos/ABCD/ref.jpg`);
+  await page.getByRole('button', { name: 'Hide reference photo' }).click();
+  assert.equal(await page.isVisible('#c-ref-img'), false);
+  assert.deepEqual(errors, []);
+});
+
+test('scorer: claim dialog shows the submitted and reference photos and decides from there', async () => {
+  const claim = (id, code, ref) => ({
+    id, status: 'pending', bonus_code: code, bonus_name: `Bonus ${code}`, points: 10, bonus_is_combo: false,
+    rider_number: 42, rider_name: 'Jane Smith', submitted_at: new Date().toISOString(), submitted_by: 'rider 42',
+    photo_path: `${TOKEN}/${id}.jpg`, bonus_ref_photo: ref });
+  const { page, calls, errors } = await newPage({
+    'POST /rest/v1/rpc/staff_role': () => ({ json: 'scorer' }),
+    'GET /rest/v1/bonuses': () => ({ json: [] }),
+    'HEAD /rest/v1/claims': () => ({ headers: { 'content-range': '0-1/2' } }),
+    'GET /rest/v1/claims_detail': () => ({ json: [claim('c1', 'ABCD', 'ABCD/ref.jpg'), claim('c2', 'WXYZ', null)] }),
+    'POST /storage/v1/object/sign/claims': (c) => ({ json: c.json.paths.map((p) => ({ path: p, signedURL: `/object/sign/claims/${p}?token=t`, error: null })) }),
+    'GET /storage/v1/object/': servePng,
+    'POST /rest/v1/rpc/scorer_decide': () => ({ json: { id: 'c1', status: 'denied' } }),
+  }, { session: true });
+  await page.goto(`${APP}scorer.html`);
+  await page.locator('.claim').first().waitFor();
+
+  await page.locator('.claim', { hasText: 'WXYZ' }).locator('img').click();
+  const dlg = page.locator('#claim-dlg');
+  await dlg.waitFor();
+  assert.ok(await dlg.getByText('No reference photo for this bonus').isVisible());
+  await dlg.getByRole('button', { name: 'Close' }).click();
+  await dlg.waitFor({ state: 'hidden' });
+
+  await page.locator('.claim', { hasText: 'ABCD' }).getByRole('button', { name: /ABCD/ }).click();
+  assert.match(await dlg.getByRole('img', { name: 'Submitted photo for ABCD' }).getAttribute('src'), /object\/sign\/claims\/.*c1\.jpg/);
+  assert.equal(await dlg.getByRole('img', { name: 'Reference photo for ABCD' }).getAttribute('src'),
+    `${API}/storage/v1/object/public/bonus-photos/ABCD/ref.jpg`);
+  if (process.env.SHOTS) { await page.setViewportSize({ width: 1100, height: 760 }); await page.screenshot({ path: 'tmp/scorer-dialog.png' }); }
+
+  await dlg.getByRole('button', { name: 'Deny' }).click();
+  await dlg.getByText('Enter a reason to deny.').waitFor();
+  await dlg.getByRole('textbox').fill('not the mill');
+  await dlg.getByRole('button', { name: 'Deny' }).click();
+  await dlg.waitFor({ state: 'hidden' });
+  assert.deepEqual(calls.find((c) => c.key.includes('scorer_decide')).json,
+    { p_claim_id: 'c1', p_status: 'denied', p_reason: 'not the mill' });
+  assert.deepEqual(errors, []);
+});
+
+test('admin page is for admins only', async () => {
+  const { page } = await newPage({ 'POST /rest/v1/rpc/staff_role': () => ({ json: 'scorer' }) }, { session: true });
+  await page.goto(`${APP}admin.html`);
+  await page.getByText('for rally admins only').waitFor();
+  assert.deepEqual(await navLinks(page), ['Review', 'Activity', 'Leader board']);
+  assert.equal(await page.locator('#settings').count(), 0);
+});
+
+test('admin: edit riders, bonuses with a reference photo, combos; delete all', async () => {
+  const { page, calls, errors } = await newPage({
+    'POST /rest/v1/rpc/staff_role': () => ({ json: 'admin' }),
+    'GET /rest/v1/settings': () => ({ json: { id: 1, event_name: 'SNAFU Test Rally', max_attempts: 3, claims_open: true } }),
+    'GET /rest/v1/riders': () => ({ json: [{ id: 1, rider_number: 42, name: 'Jane Smith', email: 'jane@example.com', token: TOKEN }] }),
+    'GET /rest/v1/bonuses': () => ({ json: [
+      { code: 'ABCD', name: 'Old mill', points: 100, sort_order: 1, description: null, ref_photo_path: null },
+      { code: 'WXYZ', name: 'Covered bridge', points: 50, sort_order: 2, description: null, ref_photo_path: 'WXYZ/old.jpg' },
+      { code: 'ARSN', name: 'Mill + bridge', points: 25, sort_order: 3, description: null, ref_photo_path: null }] }),
+    'GET /rest/v1/combo_members': () => ({ json: [{ combo_code: 'ARSN', member_code: 'ABCD' }, { combo_code: 'ARSN', member_code: 'WXYZ' }] }),
+    'GET /storage/v1/object/public/bonus-photos/': servePng,
+    'PATCH /rest/v1/riders': () => ({ status: 204 }),
+    'PATCH /rest/v1/bonuses': () => ({ status: 204 }),
+    'POST /rest/v1/bonuses': () => ({ status: 201 }),
+    'DELETE /rest/v1/bonuses': () => ({ status: 409, json: { code: '23503', message: 'update or delete on table "bonuses" violates foreign key constraint' } }),
+    'POST /storage/v1/object/bonus-photos/': () => ({ json: { Key: 'bonus-photos/x' } }),
+    'DELETE /storage/v1/object/bonus-photos': () => ({ json: [] }),
+    'POST /rest/v1/rpc/admin_set_combo': () => ({ json: 3 }),
+    'POST /rest/v1/rpc/admin_delete_all': () => ({ json: 1 }),
+  }, { session: true });
+  page.on('dialog', (d) => d.accept());   // "Are you sure?" prompts
+  await page.goto(`${APP}admin.html`);
+  await page.locator('#combos tbody', { hasText: 'ABCD, WXYZ' }).waitFor();
+  const edit = page.locator('#edit');
+
+  // Rider: edit the name
+  await page.click('[data-edit-rider="1"]');
+  await edit.locator('#f-name').fill('Jane Q Smith');
+  await edit.getByRole('button', { name: 'Save' }).click();
+  await edit.waitFor({ state: 'hidden' });
+  const pr = calls.find((c) => c.key === 'PATCH /rest/v1/riders');
+  assert.equal(pr.url.searchParams.get('id'), 'eq.1');
+  assert.deepEqual(pr.json, { rider_number: 42, name: 'Jane Q Smith', email: 'jane@example.com' });
+
+  // Bonus: replace the reference photo (shrunk, uploaded, old file removed)
+  await page.click('[data-edit-bonus="WXYZ"]');
+  assert.equal(await edit.locator('#f-code').getAttribute('readonly'), '');
+  await edit.locator('#f-photo').setInputFiles({ name: 'ref.png', mimeType: 'image/png', buffer: PNG });
+  await edit.getByRole('button', { name: 'Save' }).click();
+  await edit.waitFor({ state: 'hidden' });
+  const up = calls.find((c) => c.key.startsWith('POST /storage/v1/object/bonus-photos/'));
+  assert.match(up.key, /bonus-photos\/WXYZ\/[0-9a-f-]{36}\.jpg$/);
+  const pb = calls.find((c) => c.key === 'PATCH /rest/v1/bonuses');
+  assert.equal(pb.url.searchParams.get('code'), 'eq.WXYZ');
+  assert.equal(pb.json.ref_photo_path, up.key.replace('POST /storage/v1/object/bonus-photos/', ''));
+  assert.deepEqual((await callMade(page, calls, (c) => c.key === 'DELETE /storage/v1/object/bonus-photos')).json, { prefixes: ['WXYZ/old.jpg'] });
+
+  // Bonus: add one; the code is checked first
+  await page.click('[data-add="bonus"]');
+  await edit.locator('#f-code').fill('ab12');
+  await edit.locator('#f-points').fill('5');
+  await edit.getByRole('button', { name: 'Save' }).click();
+  await edit.getByText('"AB12" is not 4 letters').waitFor();
+  await edit.locator('#f-code').fill('new1');
+  await edit.getByRole('button', { name: 'Save' }).click();
+  await edit.waitFor({ state: 'hidden' });
+  assert.deepEqual(calls.find((c) => c.key === 'POST /rest/v1/bonuses').json,
+    { code: 'NEW1', name: null, points: 5, description: null, sort_order: null });
+
+  // Bonus with claims cannot be deleted; the message says why
+  await page.click('[data-del-bonus="ABCD"]');
+  await page.locator('#bonuses-msg', { hasText: 'Bonus ABCD has claims' }).waitFor();
+
+  // Combo: members typed in any case, commas or spaces
+  await page.click('[data-edit-combo="ARSN"]');
+  await edit.locator('#f-members').fill('abcd wxyz, abc1');
+  await edit.getByRole('button', { name: 'Save' }).click();
+  await edit.waitFor({ state: 'hidden' });
+  assert.deepEqual(calls.find((c) => c.key === 'POST /rest/v1/rpc/admin_set_combo').json,
+    { p_combo: 'ARSN', p_members: ['ABCD', 'WXYZ', 'ABC1'] });
+
+  // Delete all riders
+  await page.selectOption('#del-what', 'riders');
+  assert.equal(await page.getAttribute('#del-confirm', 'placeholder'), 'Type DELETE ALL RIDERS');
+  await page.fill('#del-confirm', 'DELETE ALL RIDERS');
+  await page.getByRole('button', { name: 'Delete all riders' }).click();
+  await page.getByText('Deleted 1 rider.').waitFor();
+  assert.deepEqual(calls.find((c) => c.key === 'POST /rest/v1/rpc/admin_delete_all').json,
+    { p_what: 'riders', p_confirm: 'DELETE ALL RIDERS' });
+  if (process.env.SHOTS) { await page.setViewportSize({ width: 1200, height: 900 }); await page.screenshot({ path: 'tmp/admin.png', fullPage: true }); }
   assert.deepEqual(errors, []);
 });

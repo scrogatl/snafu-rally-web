@@ -8,7 +8,7 @@
 --   combo_members  combo code -> member bonus codes (one row per pair)
 --   claims         one row per submission attempt; status pending / approved / denied
 --   claim_events   audit log of every insert and status change (written by trigger)
---   scorers        email addresses allowed to use the scorer and admin pages
+--   scorers        email addresses allowed to use the scorer pages; is_admin also allows the admin page
 --
 -- Riders never log in. Every rider action goes through a function that takes
 -- their token, so the anon key alone cannot read or change anything else.
@@ -32,6 +32,16 @@ insert into settings (id) values (1) on conflict do nothing;
 create table if not exists scorers (
   email text primary key check (email = lower(email))
 );
+-- Admins manage the event (settings, riders, bonuses, combos, links, deletes). Scorers only review.
+-- When this column is first added to an existing project, every scorer already there becomes an
+-- admin, so nobody who could use the admin page before is locked out.
+do $$ begin
+  if not exists (select 1 from information_schema.columns
+                 where table_schema = 'public' and table_name = 'scorers' and column_name = 'is_admin') then
+    alter table scorers add column is_admin boolean not null default false;
+    update scorers set is_admin = true;
+  end if;
+end $$;
 
 create table if not exists riders (
   id            bigint generated always as identity primary key,
@@ -53,6 +63,8 @@ create table if not exists bonuses (
   sort_order    int,
   created_at    timestamptz not null default now()
 );
+-- Reference photo of the bonus (object path in the public "bonus-photos" bucket)
+alter table bonuses add column if not exists ref_photo_path text;
 
 create table if not exists combo_members (
   combo_code    text not null references bonuses(code) on update cascade on delete cascade,
@@ -110,6 +122,17 @@ $$;
 create or replace function is_scorer() returns boolean
 language sql stable security definer set search_path = public as $$
   select exists (select 1 from scorers where email = current_email())
+$$;
+
+create or replace function is_admin() returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from scorers where email = current_email() and is_admin)
+$$;
+
+-- What the signed-in person may do: 'admin', 'scorer' or null. Pages use it to pick what to show.
+create or replace function staff_role() returns text
+language sql stable security definer set search_path = public as $$
+  select case when is_admin then 'admin' else 'scorer' end from scorers where email = current_email()
 $$;
 
 -- Used by the storage upload policy: the first folder of an upload path must be a real rider token
@@ -239,7 +262,8 @@ create or replace view rider_scores with (security_invoker = true) as
 
 create or replace view claims_detail with (security_invoker = true) as
   select c.*, r.rider_number, r.name as rider_name,
-         b.name as bonus_name, b.points, is_combo(b.code) as bonus_is_combo
+         b.name as bonus_name, b.points, is_combo(b.code) as bonus_is_combo,
+         b.ref_photo_path as bonus_ref_photo
   from claims c
   join riders r on r.id = c.rider_id
   join bonuses b on b.code = c.bonus_code;
@@ -294,6 +318,7 @@ begin
       select json_agg(json_build_object(
                'code', b.code, 'name', b.name, 'points', b.points,
                'description', b.description, 'is_combo', is_combo(b.code),
+               'ref_photo', b.ref_photo_path,
                -- true when this bonus counts toward the score (approved, or a combo with every part approved)
                'counted', exists (select 1 from approved_effective e where e.rider_id = r.id and e.bonus_code = b.code),
                'attempts', (select count(*) from claims c where c.rider_id = r.id and c.bonus_code = b.code),
@@ -409,6 +434,14 @@ begin
   end if;
 end $$;
 
+create or replace function require_admin() returns void
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not is_admin() then
+    raise exception 'Not authorized. Only rally admins can do this.' using errcode = '42501';
+  end if;
+end $$;
+
 create or replace function scorer_decide(p_claim_id uuid, p_status claim_status, p_reason text default null)
 returns claims
 language plpgsql volatile security definer set search_path = public as $$
@@ -449,19 +482,21 @@ create or replace function scorer_new_token(p_rider_number int) returns uuid
 language plpgsql volatile security definer set search_path = public as $$
 declare t uuid;
 begin
-  perform require_scorer();
+  perform require_admin();
   update riders set token = gen_random_uuid() where rider_number = p_rider_number returning token into t;
   if t is null then raise exception 'Rider % not found.', p_rider_number using errcode = 'P0001'; end if;
   return t;
 end $$;
 
--- Scorer list with last sign-in time from Supabase Auth (for the activity page)
-create or replace function scorer_list() returns table (email text, last_sign_in_at timestamptz)
+-- Scorer list with role and last sign-in time from Supabase Auth (for the activity page).
+-- Dropped first because its columns changed (is_admin added); create or replace cannot do that.
+drop function if exists scorer_list();
+create function scorer_list() returns table (email text, is_admin boolean, last_sign_in_at timestamptz)
 language plpgsql stable security definer set search_path = public as $$
 begin
   perform require_scorer();
   return query
-    select s.email, (select max(u.last_sign_in_at) from auth.users u where lower(u.email) = s.email)
+    select s.email, s.is_admin, (select max(u.last_sign_in_at) from auth.users u where lower(u.email) = s.email)
     from scorers s order by s.email;
 end $$;
 
@@ -469,7 +504,7 @@ create or replace function scorer_delete_all_claims(p_confirm text) returns int
 language plpgsql volatile security definer set search_path = public as $$
 declare n int;
 begin
-  perform require_scorer();
+  perform require_admin();
   if p_confirm <> 'DELETE ALL CLAIMS' then
     raise exception 'Type DELETE ALL CLAIMS to confirm.' using errcode = 'P0001';
   end if;
@@ -478,8 +513,63 @@ begin
   return n;
 end $$;
 
+-- Delete every rider, bonus or combo (admin page). p_what is 'riders', 'bonuses' or 'combos';
+-- p_confirm must be the matching phrase, e.g. 'DELETE ALL RIDERS'. Riders and bonuses take their
+-- claims with them (a claim cannot exist without both). Deleting combos keeps the combo bonuses
+-- themselves and only removes which bonuses make up each combo. Photos stay in storage.
+create or replace function admin_delete_all(p_what text, p_confirm text) returns int
+language plpgsql volatile security definer set search_path = public as $$
+declare n int; phrase text := 'DELETE ALL ' || upper(coalesce(p_what, ''));
+begin
+  perform require_admin();
+  if p_what not in ('riders', 'bonuses', 'combos') then
+    raise exception 'Unknown list %.', p_what using errcode = 'P0001';
+  end if;
+  if coalesce(p_confirm, '') <> phrase then
+    raise exception 'Type % to confirm.', phrase using errcode = 'P0001';
+  end if;
+  if p_what = 'riders' then
+    delete from riders where true;            -- claims go with them (on delete cascade)
+  elsif p_what = 'bonuses' then
+    delete from claims where true;            -- every claim is for some bonus
+    delete from bonuses where true;           -- combo members go with them
+  else
+    delete from combo_members where true;
+  end if;
+  get diagnostics n = row_count;
+  return n;
+end $$;
+
+-- Set which bonuses make up a combo, all at once (admin page). An empty list removes the combo
+-- (the combo bonus itself stays). Returns the number of members saved.
+create or replace function admin_set_combo(p_combo text, p_members text[]) returns int
+language plpgsql volatile security definer set search_path = public as $$
+declare v_combo text := upper(trim(coalesce(p_combo, ''))); v_members text[]; bad text;
+begin
+  perform require_admin();
+  select coalesce(array_agg(distinct m), '{}') into v_members
+    from (select upper(trim(x)) m from unnest(coalesce(p_members, '{}')) x) t where m <> '';
+  if not exists (select 1 from bonuses where code = v_combo) then
+    raise exception 'Bonus % not found. Add the combo as a bonus first.', v_combo using errcode = 'P0001';
+  end if;
+  if v_combo = any (v_members) then
+    raise exception 'A combo cannot include itself.' using errcode = 'P0001';
+  end if;
+  select string_agg(m, ', ' order by m) into bad
+    from unnest(v_members) m where not exists (select 1 from bonuses where code = m);
+  if bad is not null then
+    raise exception 'Bonus not found: %.', bad using errcode = 'P0001';
+  end if;
+  if cardinality(v_members) = 1 then
+    raise exception 'A combo needs at least 2 bonuses.' using errcode = 'P0001';
+  end if;
+  delete from combo_members where combo_code = v_combo;
+  insert into combo_members (combo_code, member_code) select v_combo, m from unnest(v_members) m;
+  return cardinality(v_members);
+end $$;
+
 -- ---------------------------------------------------------------------------
--- Row level security: scorers see and manage everything, anon sees nothing directly
+-- Row level security: scorers read everything, admins change the event setup, anon sees nothing
 -- ---------------------------------------------------------------------------
 alter table settings      enable row level security;
 alter table scorers       enable row level security;
@@ -489,16 +579,29 @@ alter table combo_members enable row level security;
 alter table claims        enable row level security;
 alter table claim_events  enable row level security;
 
+-- Event setup: every scorer reads it (the review page needs riders and bonuses), only admins change it
 drop policy if exists scorer_all on settings;
-create policy scorer_all on settings      for all to authenticated using (is_scorer()) with check (is_scorer());
+drop policy if exists scorer_all on riders;
+drop policy if exists scorer_all on bonuses;
+drop policy if exists scorer_all on combo_members;
+drop policy if exists scorer_read on settings;
+create policy scorer_read on settings      for select to authenticated using (is_scorer());
+drop policy if exists admin_all on settings;
+create policy admin_all on settings        for all to authenticated using (is_admin()) with check (is_admin());
+drop policy if exists scorer_read on riders;
+create policy scorer_read on riders        for select to authenticated using (is_scorer());
+drop policy if exists admin_all on riders;
+create policy admin_all on riders          for all to authenticated using (is_admin()) with check (is_admin());
+drop policy if exists scorer_read on bonuses;
+create policy scorer_read on bonuses       for select to authenticated using (is_scorer());
+drop policy if exists admin_all on bonuses;
+create policy admin_all on bonuses         for all to authenticated using (is_admin()) with check (is_admin());
+drop policy if exists scorer_read on combo_members;
+create policy scorer_read on combo_members for select to authenticated using (is_scorer());
+drop policy if exists admin_all on combo_members;
+create policy admin_all on combo_members   for all to authenticated using (is_admin()) with check (is_admin());
 drop policy if exists scorer_read on scorers;
 create policy scorer_read on scorers      for select to authenticated using (is_scorer());
-drop policy if exists scorer_all on riders;
-create policy scorer_all on riders        for all to authenticated using (is_scorer()) with check (is_scorer());
-drop policy if exists scorer_all on bonuses;
-create policy scorer_all on bonuses       for all to authenticated using (is_scorer()) with check (is_scorer());
-drop policy if exists scorer_all on combo_members;
-create policy scorer_all on combo_members for all to authenticated using (is_scorer()) with check (is_scorer());
 drop policy if exists scorer_read on claims;
 create policy scorer_read on claims       for select to authenticated using (is_scorer());
 drop policy if exists scorer_read on claim_events;
@@ -516,7 +619,7 @@ grant select, insert, update, delete on settings, riders, bonuses, combo_members
 grant select on scorers, claims, claim_events to authenticated;
 grant select on approved_direct, approved_effective, rider_scores, claims_detail,
                 claim_activity, rider_activity to authenticated;
-grant usage, select on sequence riders_id_seq to authenticated;   -- admin CSV import adds riders
+grant usage, select on sequence riders_id_seq to authenticated;   -- admin page adds riders
 grant all on all tables in schema public to service_role;
 grant all on all sequences in schema public to service_role;
 
@@ -527,6 +630,8 @@ grant execute on function rider_session(uuid)                                   
 grant execute on function rider_submit(uuid, uuid, text, text, text, timestamptz)   to anon, authenticated;
 grant execute on function leaderboard()                                             to anon, authenticated;
 grant execute on function is_scorer()                                               to anon, authenticated;
+grant execute on function is_admin()                                                to anon, authenticated;
+grant execute on function staff_role()                                              to anon, authenticated;
 grant execute on function current_email()                                           to anon, authenticated;
 grant execute on function rider_token_valid(text)                                   to anon, authenticated;
 grant execute on function is_combo(text)                                            to anon, authenticated;
@@ -537,6 +642,9 @@ grant execute on function scorer_delete_all_claims(text)                        
 grant execute on function scorer_list()                                             to authenticated;
 grant execute on function rider_photo_paths(uuid)                                   to service_role;  -- Edge Function only
 grant execute on function require_scorer()                                          to authenticated;
+grant execute on function require_admin()                                           to authenticated;
+grant execute on function admin_delete_all(text, text)                              to authenticated;
+grant execute on function admin_set_combo(text, text[])                             to authenticated;
 
 -- ---------------------------------------------------------------------------
 -- Photo storage: private bucket "claims"
@@ -560,3 +668,25 @@ create policy scorer_upload on storage.objects for insert to authenticated
 drop policy if exists scorer_read_photos on storage.objects;
 create policy scorer_read_photos on storage.objects for select to authenticated
   using (bucket_id = 'claims' and public.is_scorer());
+
+-- ---------------------------------------------------------------------------
+-- Reference photos: public bucket "bonus-photos"
+--   Shows riders and scorers what each bonus should look like. Public so the rider page (no login)
+--   and anything else (a printed rally book, say) can show a photo by its link. Files get random
+--   names and nobody but admins may list the bucket, so a photo is only seen by someone given its link.
+--   Only admins upload, replace or delete.
+-- ---------------------------------------------------------------------------
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('bonus-photos', 'bonus-photos', true, 10485760,
+        array['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'])
+on conflict (id) do nothing;
+
+drop policy if exists admin_ref_insert on storage.objects;
+create policy admin_ref_insert on storage.objects for insert to authenticated
+  with check (bucket_id = 'bonus-photos' and public.is_admin());
+drop policy if exists admin_ref_read on storage.objects;
+create policy admin_ref_read on storage.objects for select to authenticated
+  using (bucket_id = 'bonus-photos' and public.is_admin());
+drop policy if exists admin_ref_delete on storage.objects;
+create policy admin_ref_delete on storage.objects for delete to authenticated
+  using (bucket_id = 'bonus-photos' and public.is_admin());

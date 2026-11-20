@@ -24,6 +24,10 @@ the code when behavior changes. Setup steps for people: `README.md`.
   `rider_photo_paths(token)`), deployed with `--no-verify-jwt`.
 - Scorers = emails in the `scorers` table. RLS gives them full read; claim changes only through
   `scorer_decide` / `scorer_add_claim` so the status rules and audit always apply.
+- Admins = scorers with `is_admin`. Only they change settings, riders, bonuses, combos (RLS `admin_all`)
+  or call `require_admin` functions (new link, delete all, `admin_set_combo`). Pages ask `staff_role()`.
+- Bonus reference photos live in the PUBLIC bucket `bonus-photos` (`bonuses.ref_photo_path`, random file
+  names, only admins upload/list/delete), so the rider page can show them without a login.
 - Scoring mirrors the old sheet: sum of approved positive points x (1 + worst approved penalty / 100).
   Combos auto-count when all members are approved (one level only). Penalties are negative-point bonuses
   that only scorers add.

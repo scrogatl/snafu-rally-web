@@ -40,12 +40,12 @@ async function start() {
   try { me = await currentScorer(); } catch (e) { app.innerHTML = `<div class="msg error">${esc(errorText(e))}</div>`; return; }
   if (!me.session) { renderLogin(app, start); return; }
   if (!me.isScorer) {
-    app.innerHTML = `${navBar('activity.html')}<div class="msg error">${esc(me.session.user.email)} is not on the scorer list.
+    app.innerHTML = `${navBar('activity.html', me)}<div class="msg error">${esc(me.session.user.email)} is not on the scorer list.
       Ask the organizer to add it.</div>`;
     wireSignOut();
     return;
   }
-  app.innerHTML = `${navBar('activity.html')}
+  app.innerHTML = `${navBar('activity.html', me)}
     <h1>Activity</h1>
     <div class="row"><p class="muted grow" id="updated"></p>
       <button type="button" class="secondary" id="refresh">Refresh</button></div>
@@ -103,6 +103,7 @@ async function start() {
 
   scorers = sortableTable($('#scorers'), [
     { key: 'email', label: 'Email' },
+    { key: 'is_admin', label: 'Role', value: (r) => (r.is_admin ? 'admin' : 'scorer') },
     { key: 'last_sign_in_at', label: 'Last sign-in', desc: true, value: timeValue('last_sign_in_at'), cell: timeCell('last_sign_in_at') },
   ], { sort: { key: 'email', dir: 'asc' }, store: 'activity_sort_scorers', empty: 'No scorers.' });
 

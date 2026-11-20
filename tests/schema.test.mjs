@@ -7,7 +7,8 @@ import { PGlite } from '@electric-sql/pglite';
 import { pgcrypto } from '@electric-sql/pglite/contrib/pgcrypto';
 
 const read = (p) => readFileSync(new URL(p, import.meta.url), 'utf8');
-const SCORER = 'scorer@example.com';
+const SCORER = 'scorer@example.com';   // reviews claims only
+const ADMIN = 'admin@example.com';     // also runs the admin page
 let db, token42, token7;
 
 // Run fn as a Supabase role, optionally as a logged-in user with this email
@@ -21,6 +22,7 @@ async function as(role, email, fn) {
 }
 const rider = (fn) => as('anon', null, fn);
 const scorer = (fn) => as('authenticated', SCORER, fn);
+const admin = (fn) => as('authenticated', ADMIN, fn);
 const one = async (tx, sql, params) => (await tx.query(sql, params)).rows[0];
 const rejects = (p, re) => assert.rejects(p, (e) => { assert.match(e.message, re); return true; });
 const uuid = () => crypto.randomUUID();
@@ -31,7 +33,8 @@ before(async () => {
   await db.exec(read('../supabase/schema.sql'));
   await db.exec(read('../supabase/schema.sql')); // re-running must be safe
   await db.exec(`
-    insert into scorers values ('${SCORER}');
+    insert into scorers (email) values ('${SCORER}');
+    insert into scorers (email, is_admin) values ('${ADMIN}', true);
     insert into riders (rider_number, name, email) values (42, 'Jane Smith', 'jane@example.com'), (7, 'Bob Jones', null);
     insert into bonuses (code, name, points) values
       ('ABCD', 'Old mill', 100), ('WXYZ', 'Covered bridge', 50),
@@ -53,14 +56,16 @@ test('anon key alone cannot read tables', async () => {
   }
 });
 
-test('table grants: scorers can do what the admin page does; non-scorers see nothing', async () => {
-  // Same operations as admin.html: settings update, riders/bonuses upsert, combos replaced
-  await scorer(async (tx) => {
+test('table grants: admins can do what the admin page does; non-scorers see nothing', async () => {
+  // Same operations as admin.html: settings update, riders/bonuses upsert and edit, combos replaced
+  await admin(async (tx) => {
     await tx.query(`update settings set max_attempts = max_attempts`);
     await tx.query(`insert into riders (rider_number, name) values (900, 'Grant Test')
                     on conflict (rider_number) do update set name = excluded.name`);
     await tx.query(`insert into bonuses (code, points) values ('GRNT', 5)
                     on conflict (code) do update set points = excluded.points`);
+    await tx.query(`update bonuses set ref_photo_path = 'GRNT/x.jpg' where code = 'GRNT'`);
+    await tx.query(`delete from riders where rider_number = 900`);
     await tx.query(`delete from combo_members where combo_code = 'GRNT'`);
     for (const v of ['rider_scores', 'claims_detail', 'claim_events', 'scorers']) await tx.query(`select * from ${v}`);
     throw new Error('rollback');
@@ -225,8 +230,8 @@ test('activity: rider last seen, claim feed, rider summary, scorer sign-ins', as
   // Scorer list with last sign-in from Supabase Auth
   await db.query(`insert into auth.users (email, last_sign_in_at) values ($1, now())`, [SCORER.toUpperCase()]);
   const list = (await scorer((tx) => tx.query('select * from scorer_list()'))).rows;
-  assert.deepEqual(list.map((r) => r.email), [SCORER]);
-  assert.ok(list[0].last_sign_in_at, 'matched case-insensitively');
+  assert.deepEqual(list.map((r) => [r.email, r.is_admin]), [[ADMIN, true], [SCORER, false]]);
+  assert.ok(list[1].last_sign_in_at, 'matched case-insensitively');
   await rejects(stranger((tx) => tx.query('select * from scorer_list()')), /Not authorized/);
   await rejects(rider((tx) => tx.query('select * from scorer_list()')), /permission denied/);
 });
@@ -236,8 +241,9 @@ test('closing claims and scorer reset', async () => {
   await rejects(rider((tx) => tx.query('select rider_submit($1,$2,$3,$4,null,null)', [token7, uuid(), 'WXYZ', `${token7}/1.jpg`])), /Claims are closed/);
   await db.exec('update settings set claims_open = true');
 
-  await rejects(scorer((tx) => tx.query(`select scorer_delete_all_claims('yes')`)), /Type DELETE ALL CLAIMS/);
-  const n = (await scorer((tx) => one(tx, `select scorer_delete_all_claims('DELETE ALL CLAIMS') n`))).n;
+  await rejects(scorer((tx) => tx.query(`select scorer_delete_all_claims('DELETE ALL CLAIMS')`)), /Only rally admins/);
+  await rejects(admin((tx) => tx.query(`select scorer_delete_all_claims('yes')`)), /Type DELETE ALL CLAIMS/);
+  const n = (await admin((tx) => one(tx, `select scorer_delete_all_claims('DELETE ALL CLAIMS') n`))).n;
   assert.ok(n > 0);
   assert.equal((await db.query('select count(*)::int n from claim_events')).rows[0].n, 0);
 });
@@ -270,6 +276,99 @@ test('rider sees own submission history; photo lookup is for the Edge Function o
   await rider((tx) => tx.query(`insert into storage.objects (bucket_id, name) values ('claims', $1)`, [`${token7}/h1.jpg`]));
   assert.ok((await db.query('select count(*)::int n from storage.objects')).rows[0].n > 0);
   assert.equal((await rider((tx) => tx.query('select * from storage.objects'))).rows.length, 0);
+});
+
+test('scorers review; only admins change the event setup', async () => {
+  assert.equal((await scorer((tx) => one(tx, 'select staff_role() r'))).r, 'scorer');
+  assert.equal((await admin((tx) => one(tx, 'select staff_role() r'))).r, 'admin');
+  assert.equal((await as('authenticated', 'random@example.com', (tx) => one(tx, 'select staff_role() r'))).r, null);
+  assert.equal((await rider((tx) => one(tx, 'select staff_role() r'))).r, null);
+
+  // A plain scorer can read the setup (the review page needs it) but not change it
+  await scorer(async (tx) => {
+    assert.ok((await tx.query('select * from riders')).rows.length > 0);
+    assert.ok((await tx.query('select * from bonuses')).rows.length > 0);
+    assert.ok((await tx.query('select * from combo_members')).rows.length > 0);
+    assert.equal((await tx.query('select * from settings')).rows.length, 1);
+  });
+  await rejects(scorer((tx) => tx.query(`insert into riders (rider_number, name) values (902, 'x')`)), /row-level security/);
+  assert.equal((await scorer((tx) => tx.query(`update settings set max_attempts = 9`))).affectedRows, 0);
+  assert.equal((await scorer((tx) => tx.query(`update bonuses set points = 1`))).affectedRows, 0);
+  assert.equal((await scorer((tx) => tx.query(`delete from riders`))).affectedRows, 0);
+  for (const sql of [`select scorer_new_token(42)`, `select admin_delete_all('riders', 'DELETE ALL RIDERS')`,
+    `select admin_set_combo('ARSN', array['ABCD'])`]) {
+    await rejects(scorer((tx) => tx.query(sql)), /Only rally admins/);
+  }
+  // Scorers can still add and decide claims
+  const c = await scorer((tx) => one(tx, `select * from scorer_add_claim(42, 'ABC1', 'pending')`));
+  await scorer((tx) => tx.query(`select scorer_decide($1, 'denied', 'test')`, [c.id]));
+});
+
+test('admin: edit a combo, reference photos, delete everything', async () => {
+  // Combos are set as a whole and checked
+  await rejects(admin((tx) => tx.query(`select admin_set_combo('NOPE', array['ABCD','WXYZ'])`)), /Bonus NOPE not found/);
+  await rejects(admin((tx) => tx.query(`select admin_set_combo('ARSN', array['ARSN','ABCD'])`)), /cannot include itself/);
+  await rejects(admin((tx) => tx.query(`select admin_set_combo('ARSN', array['ABCD','ZZZZ'])`)), /Bonus not found: ZZZZ/);
+  await rejects(admin((tx) => tx.query(`select admin_set_combo('ARSN', array['ABCD'])`)), /at least 2/);
+  const n = (await admin((tx) => one(tx, `select admin_set_combo(' arsn ', array['abcd',' WXYZ ','ABC1','ABCD']) n`))).n;
+  assert.equal(n, 3);
+  const members = async () => (await db.query(`select member_code from combo_members where combo_code = 'ARSN' order by 1`)).rows.map((r) => r.member_code);
+  assert.deepEqual(await members(), ['ABC1', 'ABCD', 'WXYZ']);
+  await admin((tx) => tx.query(`select admin_set_combo('ARSN', array['ABCD','WXYZ'])`));
+  assert.deepEqual(await members(), ['ABCD', 'WXYZ']);
+
+  // Reference photo reaches the rider page and the scorer's claim view
+  await admin((tx) => tx.query(`update bonuses set ref_photo_path = 'ABCD/ref.jpg' where code = 'ABCD'`));
+  const s = (await rider((tx) => one(tx, 'select rider_session($1) as s', [token42]))).s;
+  assert.equal(s.bonuses.find((b) => b.code === 'ABCD').ref_photo, 'ABCD/ref.jpg');
+  assert.equal(s.bonuses.find((b) => b.code === 'WXYZ').ref_photo, null);
+  await admin((tx) => tx.query(`select scorer_add_claim(42, 'ABCD', 'pending')`));
+  const d = await scorer((tx) => one(tx, `select bonus_ref_photo from claims_detail where bonus_code = 'ABCD' limit 1`));
+  assert.equal(d.bonus_ref_photo, 'ABCD/ref.jpg');
+
+  // Only admins may upload reference photos
+  await admin((tx) => tx.query(`insert into storage.objects (bucket_id, name) values ('bonus-photos', 'ABCD/ref.jpg')`));
+  await rejects(scorer((tx) => tx.query(`insert into storage.objects (bucket_id, name) values ('bonus-photos', 'x.jpg')`)), /row-level security/);
+  await rejects(rider((tx) => tx.query(`insert into storage.objects (bucket_id, name) values ('bonus-photos', $1)`, [`${token42}/x.jpg`])), /row-level security/);
+  assert.equal((await scorer((tx) => tx.query(`select * from storage.objects where bucket_id = 'bonus-photos'`))).rows.length, 0);
+  assert.equal((await admin((tx) => tx.query(`select * from storage.objects where bucket_id = 'bonus-photos'`))).rows.length, 1);
+
+  // Delete all needs the exact phrase for that list
+  await rejects(admin((tx) => tx.query(`select admin_delete_all('claims', 'DELETE ALL CLAIMS')`)), /Unknown list/);
+  await rejects(admin((tx) => tx.query(`select admin_delete_all('riders', 'DELETE ALL BONUSES')`)), /Type DELETE ALL RIDERS/);
+  const count = async (t) => (await db.query(`select count(*)::int n from ${t}`)).rows[0].n;
+
+  assert.equal((await admin((tx) => one(tx, `select admin_delete_all('combos', 'DELETE ALL COMBOS') n`))).n, 2);
+  assert.equal(await count('combo_members'), 0);
+  assert.ok(await db.query(`select 1 from bonuses where code = 'ARSN'`).then((r) => r.rows.length === 1), 'combo bonus stays');
+
+  const riders = await count('riders');
+  assert.equal((await admin((tx) => one(tx, `select admin_delete_all('riders', 'DELETE ALL RIDERS') n`))).n, riders);
+  assert.equal(await count('riders'), 0);
+  assert.equal(await count('claims'), 0);
+
+  await db.exec(`insert into riders (rider_number, name) values (5, 'Back Again')`);
+  await db.exec(`insert into claims (rider_id, bonus_code, status) select id, 'ABCD', 'pending' from riders`);
+  await db.exec(`insert into combo_members values ('ARSN', 'ABCD'), ('ARSN', 'WXYZ')`);
+  const bonuses = await count('bonuses');
+  assert.equal((await admin((tx) => one(tx, `select admin_delete_all('bonuses', 'DELETE ALL BONUSES') n`))).n, bonuses);
+  assert.equal(await count('bonuses'), 0);
+  assert.equal(await count('claims'), 0);
+  assert.equal(await count('combo_members'), 0);
+  assert.equal(await count('riders'), 1, 'riders are kept');
+});
+
+test('existing scorers become admins when the admin column is first added', async () => {
+  await db.transaction(async (tx) => {
+    await tx.exec(`alter table scorers drop column is_admin; insert into scorers (email) values ('old@example.com');`);
+    await tx.exec(read('../supabase/schema.sql'));
+    const r = (await tx.query(`select bool_and(is_admin) all_admin from scorers`)).rows[0];
+    assert.equal(r.all_admin, true);
+    await tx.exec(`insert into scorers (email) values ('new@example.com')`);
+    await tx.exec(read('../supabase/schema.sql'));   // re-run does not promote new scorers
+    assert.equal((await tx.query(`select is_admin from scorers where email = 'new@example.com'`)).rows[0].is_admin, false);
+    await tx.rollback();
+  });
 });
 
 test('reset.sql removes everything', async () => {

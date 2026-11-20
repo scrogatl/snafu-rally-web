@@ -107,3 +107,17 @@ tr.attention td { background: var(--warn-bg); }
 /* Rider: past submissions for a bonus */
 h3 { font-size: 1rem; margin: 0; }
 .history-item { display: flex; flex-direction: column; gap: 8px; padding: 10px 0; }
+/* Admin edit dialog */
+dialog.editor { width: min(560px, 96vw); padding: 16px; }
+dialog.editor input[readonly] { background: var(--bg); color: var(--muted); }
+/* Scorer claim dialog: submitted photo next to the reference photo */
+dialog.compare { width: min(1100px, 96vw); padding: 16px; }
+.compare-photos { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.compare-photos figure { margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.compare-photos figcaption { font-weight: 600; color: var(--muted); font-size: 0.9rem; }
+.compare-photos img { width: 100%; max-width: 100%; max-height: 60vh; object-fit: contain; border-radius: 8px; background: var(--bg); }
+.compare-photos .nophoto { min-height: 160px; border-radius: 8px; background: var(--bg); display: grid; place-items: center; color: var(--muted); text-align: center; padding: 12px; }
+@media (max-width: 640px) { .compare-photos { grid-template-columns: 1fr; } }
+button.open-claim { padding: 0; text-align: left; color: inherit; font-weight: inherit; }
+.claim img { cursor: pointer; }
+table.data img.thumb { cursor: pointer; }

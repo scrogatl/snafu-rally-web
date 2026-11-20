@@ -6,7 +6,11 @@ export const configured = !SUPABASE_URL.includes('YOUR-PROJECT-REF') && !SUPABAS
 export const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: { persistSession: true, detectSessionInUrl: true },
 });
-export const BUCKET = 'claims';
+export const BUCKET = 'claims';            // claim photos (private)
+export const REF_BUCKET = 'bonus-photos';  // bonus reference photos (public link, admins upload)
+
+// Link to a bonus reference photo, or '' when the bonus has none
+export const refPhotoUrl = (path) => (path ? sb.storage.from(REF_BUCKET).getPublicUrl(path).data.publicUrl : '');
 
 export const $ = (sel, root = document) => root.querySelector(sel);
 export const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => (
@@ -67,13 +71,14 @@ export const newId = () => (crypto.randomUUID ? crypto.randomUUID()
   : '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, (c) =>
       (c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (c / 4)))).toString(16)));
 
-// Scorer login helpers
+// Scorer login helpers. role: 'admin' (scorer + admin page), 'scorer' (review only) or null.
 export async function currentScorer() {
   const { data: { session } } = await sb.auth.getSession();
-  if (!session) return { session: null, isScorer: false };
-  const { data, error } = await sb.rpc('is_scorer');
+  if (!session) return { session: null, role: null, isScorer: false, isAdmin: false };
+  const { data, error } = await sb.rpc('staff_role');
   if (error) throw error;
-  return { session, isScorer: data === true };
+  const role = data || null;
+  return { session, role, isScorer: !!role, isAdmin: role === 'admin' };
 }
 
 export function renderLogin(container, onDone) {
@@ -100,12 +105,15 @@ export function renderLogin(container, onDone) {
   sb.auth.onAuthStateChange((event) => { if (event === 'SIGNED_IN') onDone?.(); });
 }
 
-export function navBar(active) {
-  const links = [['scorer.html', 'Review'], ['activity.html', 'Activity'], ['admin.html', 'Admin'],
+// Links for the signed-in person (who = currentScorer()): Admin only for admins
+export function navBar(active, who = {}) {
+  const links = [
+    ...(who.isScorer ? [['scorer.html', 'Review'], ['activity.html', 'Activity']] : []),
+    ...(who.isAdmin ? [['admin.html', 'Admin']] : []),
     ['leaderboard.html', 'Leader board']];
   return `<nav class="nav">${links.map(([href, label]) =>
     `<a href="${href}" class="${active === href ? 'active' : ''}">${label}</a>`).join('')}
-    <button type="button" class="link" id="sign-out">Sign out</button></nav>`;
+    ${who.session ? '<button type="button" class="link" id="sign-out">Sign out</button>' : ''}</nav>`;
 }
 
 export function wireSignOut() {

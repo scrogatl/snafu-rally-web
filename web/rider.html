@@ -43,6 +43,11 @@
         <p class="muted" id="c-meta"></p>
         <p id="c-desc"></p>
       </div>
+      <div id="c-ref" class="stack" hidden>
+        <button type="button" class="secondary" id="c-ref-btn">Show reference photo</button>
+        <img id="c-ref-img" class="photo-preview" alt="Reference photo" hidden>
+        <div id="c-ref-msg" class="msg error" hidden></div>
+      </div>
       <div id="c-history" class="stack" hidden>
         <h3>Your submissions</h3>
         <ul class="list" id="c-history-list"></ul>
@@ -67,7 +72,7 @@
 </main>
 
 <script type="module">
-import { sb, $, esc, fmtTime, errorText, showMessage, setupBanner, shrinkImage, newId, BUCKET } from './lib.js';
+import { sb, $, esc, fmtTime, errorText, showMessage, setupBanner, shrinkImage, newId, BUCKET, refPhotoUrl } from './lib.js';
 import { SUPABASE_URL } from './config.js';
 setupBanner();
 
@@ -254,6 +259,12 @@ function openClaim(code, keepDraft = false) {
   $('#c-meta').textContent = `${current.points} pts` +
     (current.attempts ? ` - ${current.attempts} of ${session.max_attempts} attempts used` : '');
   $('#c-desc').textContent = current.description || '';
+  // Reference photo: what the bonus should look like. Loaded only on tap, to save data.
+  $('#c-ref').hidden = !current.ref_photo;
+  $('#c-ref-img').hidden = true;
+  $('#c-ref-img').removeAttribute('src');
+  $('#c-ref-btn').textContent = 'Show reference photo';
+  showMessage($('#c-ref-msg'), '');
   showMessage($('#c-history-msg'), '');
   renderHistory();
   $('#photo-label').innerHTML = current.is_combo
@@ -274,6 +285,23 @@ function openClaim(code, keepDraft = false) {
 }
 
 $('#search').addEventListener('input', renderList);
+$('#c-ref-btn').addEventListener('click', () => {
+  const img = $('#c-ref-img');
+  const show = img.hidden;
+  if (show && !img.getAttribute('src')) img.src = refPhotoUrl(current.ref_photo);
+  img.hidden = !show;
+  $('#c-ref-btn').textContent = show ? 'Hide reference photo' : 'Show reference photo';
+  showMessage($('#c-ref-msg'), '');
+});
+$('#c-ref-img').addEventListener('error', () => {
+  const img = $('#c-ref-img');
+  if (!img.getAttribute('src')) return;
+  img.hidden = true;
+  img.removeAttribute('src');
+  $('#c-ref-btn').textContent = 'Show reference photo';
+  showMessage($('#c-ref-msg'), navigator.onLine === false
+    ? errorText(new Error('Failed to fetch')) : 'Could not load the reference photo. Try again.', 'error');
+});
 $('#c-history-list').addEventListener('click', (ev) => {
   const b = ev.target.closest('[data-photo]');
   if (b) showPhotos(b);

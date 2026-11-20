@@ -21,6 +21,7 @@ Principles:
 - **Rules live in the database**, not only in the UI. The UI only gives friendlier messages.
 - Riders never log in. A secret token in their personal link identifies them.
 - Scorers log in with an emailed magic link; only emails in a `scorers` table have access.
+  Scorers review claims; only scorers marked `is_admin` can use the admin page and change the event setup.
 - Plain HTML + ES modules, **no build step** for the pages.
 - Plain English in code, comments and messages. ASCII only in code.
 - Config separate from code (`web/config.js`).
@@ -100,9 +101,9 @@ web/lib.js                 shared helpers
 web/styles.css
 web/index.html             landing
 web/rider.html
-web/scorer.html
+web/scorer.html            claim review (cards / table, claim dialog with reference photo)
 web/activity.html          scorer activity: claim feed, riders last seen, scorer sign-ins
-web/admin.html
+web/admin.html             admins only: settings, CSV import, edit riders / bonuses / combos, deletes
 web/leaderboard.html
 ```
 
@@ -126,6 +127,10 @@ Supabase SQL Editor and Run; safe to re-run; run reset.sql first to start over.
 
 **scorers**
 - `email text primary key check (email = lower(email))`
+- `is_admin boolean not null default false` (admin page access). Added in a `do` block only when the
+  column is missing; at that moment every existing scorer is made an admin so nobody loses access.
+  Later re-runs never promote anyone. Make someone an admin with
+  `update scorers set is_admin = true where email = '...'`.
 
 **riders**
 - `id bigint generated always as identity primary key`
@@ -142,6 +147,8 @@ Supabase SQL Editor and Run; safe to re-run; run reset.sql first to start over.
 - `code text primary key check (code ~ '^([A-Z]{4}|[A-Z]{3}[0-9])$')` (4 letters, or 3 letters + 1 digit)
 - `name text`, `points int not null` (negative = percent penalty), `description text`,
   `sort_order int`, `created_at timestamptz not null default now()`
+- `ref_photo_path text`: reference photo, object path in the public `bonus-photos` bucket
+  (`alter table ... add column if not exists`)
 
 **combo_members**
 - `combo_code text not null references bonuses(code) on update cascade on delete cascade`
@@ -181,10 +188,13 @@ Supabase SQL Editor and Run; safe to re-run; run reset.sql first to start over.
 |---|---|---|
 | `current_email()` | text | `lower(nullif(coalesce(auth.jwt() ->> 'email', ''), ''))`, sql stable |
 | `is_scorer()` | boolean | security definer, `search_path = public`; email in `scorers` |
+| `is_admin()` | boolean | security definer; email in `scorers` with `is_admin` |
+| `staff_role()` | text | security definer; `'admin'`, `'scorer'` or null. Pages use it to choose what to show. |
 | `rider_token_valid(p_token text)` | boolean | security definer; text matches `^[0-9a-fA-F-]{36}$` and a rider has that token. Used by the storage policy. |
 | `rider_from_token(p_token uuid)` | riders | security definer; raises `'This rider link is not valid. Ask the rally staff for a new one.'` (errcode P0001) |
 | `is_combo(p_code text)` | boolean | exists in `combo_members` as `combo_code` |
 | `require_scorer()` | void | raises `'Not authorized. Your email is not on the scorer list.'` errcode `42501` |
+| `require_admin()` | void | raises `'Not authorized. Only rally admins can do this.'` errcode `42501` |
 
 All user-facing errors use `errcode = 'P0001'` unless noted, so the message reaches the page.
 
@@ -217,7 +227,7 @@ All user-facing errors use `errcode = 'P0001'` unless noted, so the message reac
   `worst_penalty` (min of negative points, null if none), `bonuses_counted` (count with points >= 0),
   `score = round(base_points * (1 + coalesce(worst_penalty, 0) / 100.0), 2)`.
 - `claims_detail`: `claims.*` + `rider_number`, `rider_name`, `bonus_name`, `points`,
-  `bonus_is_combo` (via `is_combo`).
+  `bonus_is_combo` (via `is_combo`), `bonus_ref_photo` (the bonus `ref_photo_path`).
 
 **Activity views** (also `security_invoker = true`, so RLS limits them to scorers):
 - `claim_activity`: one row per `claim_events` row joined to claims, riders, bonuses:
@@ -238,7 +248,7 @@ Scoring rule (matches the old sheet): sum of approved positive bonuses, then mul
 { event_name, claims_open, max_attempts,
   rider: { number, name },
   score: { total, base_points, worst_penalty, bonuses_counted },   // from rider_scores, 0 defaults
-  bonuses: [ { code, name, points, description, is_combo,
+  bonuses: [ { code, name, points, description, is_combo, ref_photo,   // ref_photo = ref_photo_path
                counted,      // in approved_effective for this rider
                attempts,     // count of this rider's claims for the bonus
                status,       // 'approved' if any approved, else 'pending' if any pending,
@@ -274,7 +284,7 @@ p_note text default null, p_taken_at timestamptz default null) returns json`** (
 bonuses_counted bigint)`**: `rank() over (order by score desc)`, ordered by finish then rider_number.
 Security definer, callable by anon.
 
-### 4.7 Scorer functions (all call `require_scorer()` first, security definer)
+### 4.7 Scorer and admin functions (security definer; `require_scorer()` first unless marked admin)
 
 - `scorer_decide(p_claim_id uuid, p_status claim_status, p_reason text default null) returns claims`:
   update status and `reason = nullif(trim(p_reason), '')`. Not found: `'Claim not found.'`.
@@ -284,17 +294,29 @@ Security definer, callable by anon.
   rider must exist (`'Rider % not found.'`), bonus must exist incl. penalties (`'Bonus % not found.'`),
   `submitted_by = current_email()`. No photo, attempt or open/closed checks (staff override).
   On unique_violation: `'Rider % already has bonus % approved.'`
-- `scorer_new_token(p_rider_number int) returns uuid`: sets a new random token (old link dies).
-- `scorer_list() returns table (email text, last_sign_in_at timestamptz)`: every `scorers` email with
-  the latest `auth.users.last_sign_in_at` matched case-insensitively (null if never signed in), ordered by email.
-- `scorer_delete_all_claims(p_confirm text) returns int`: requires exactly `'DELETE ALL CLAIMS'`
+- **admin** `scorer_new_token(p_rider_number int) returns uuid`: sets a new random token (old link dies).
+- `scorer_list() returns table (email text, is_admin boolean, last_sign_in_at timestamptz)`: every
+  `scorers` email with its role and the latest `auth.users.last_sign_in_at` matched case-insensitively
+  (null if never signed in), ordered by email. Dropped before create (its columns changed).
+- **admin** `scorer_delete_all_claims(p_confirm text) returns int`: requires exactly `'DELETE ALL CLAIMS'`
   (else `'Type DELETE ALL CLAIMS to confirm.'`); deletes all claims (events cascade); returns count.
+- **admin** `admin_delete_all(p_what text, p_confirm text) returns int`: `p_what` in `riders`, `bonuses`,
+  `combos` (else `'Unknown list %.'`); `p_confirm` must be `'DELETE ALL <P_WHAT upper>'` (else
+  `'Type DELETE ALL RIDERS to confirm.'` etc.). Riders: delete all (claims cascade). Bonuses: delete all
+  claims, then all bonuses (combo members cascade). Combos: delete all `combo_members` (combo bonuses
+  stay). Returns rows deleted from the named table. Photos stay in storage.
+- **admin** `admin_set_combo(p_combo text, p_members text[]) returns int`: codes upper/trimmed, blanks
+  and duplicates dropped. Checks: combo bonus exists (`'Bonus % not found. Add the combo as a bonus first.'`),
+  not in its own list (`'A combo cannot include itself.'`), every member exists (`'Bonus not found: A, B.'`),
+  not exactly one member (`'A combo needs at least 2 bonuses.'`). Replaces that combo's rows in one go;
+  an empty list removes the combo. Returns the member count.
 
 ### 4.8 Row level security and grants
 
 - Enable RLS on all seven tables.
-- Policies (to `authenticated`): `scorer_all` FOR ALL using/with check `is_scorer()` on settings,
-  riders, bonuses, combo_members. `scorer_read` FOR SELECT `is_scorer()` on scorers, claims, claim_events.
+- Policies (to `authenticated`): on settings, riders, bonuses, combo_members: `scorer_read` FOR SELECT
+  `is_scorer()` and `admin_all` FOR ALL using/with check `is_admin()` (old `scorer_all` dropped).
+  `scorer_read` FOR SELECT `is_scorer()` on scorers, claims, claim_events.
   No write policies on claims: claims change only through functions.
 - Grants (explicit so it works whether or not the project auto-exposes tables):
   - `grant usage on schema public to anon, authenticated, service_role`
@@ -304,10 +326,11 @@ Security definer, callable by anon.
   - service_role: all on tables and sequences.
   - anon: **no table access at all**.
 - Functions: `revoke execute on all functions in schema public from public, anon, authenticated`, then:
-  - anon + authenticated: `rider_session`, `rider_submit`, `leaderboard`, `is_scorer`,
-    `current_email`, `rider_token_valid`, `is_combo`
+  - anon + authenticated: `rider_session`, `rider_submit`, `leaderboard`, `is_scorer`, `is_admin`,
+    `staff_role`, `current_email`, `rider_token_valid`, `is_combo`
   - authenticated only: `scorer_decide`, `scorer_add_claim`, `scorer_new_token`,
-    `scorer_delete_all_claims`, `scorer_list`, `require_scorer`
+    `scorer_delete_all_claims`, `scorer_list`, `require_scorer`, `require_admin`, `admin_delete_all`,
+    `admin_set_combo`
   - service_role only: `rider_photo_paths`
 
 ### 4.9 Storage
@@ -324,6 +347,11 @@ Security definer, callable by anon.
 - **No rider read policy, on purpose.** Riders have no login, so a read rule could only check that a
   folder belongs to *some* rider; anyone with the anon key could then list the bucket and read every
   folder name, which is a rider token. Riders see their photos through the Edge Function instead.
+- Second bucket `bonus-photos` for reference photos: **public** (same size and type limits), so the
+  rider page and anything else (a printed rally book) can show a photo by its link
+  (`/storage/v1/object/public/bonus-photos/<path>`). Paths `<CODE>/<uuid>.<ext>` (random, not guessable).
+  Policies `admin_ref_insert` / `admin_ref_read` / `admin_ref_delete` (to authenticated, bucket
+  `bonus-photos` and `public.is_admin()`): only admins upload, list or delete. Nobody else can list it.
 
 ### 4.9a Edge Function `supabase/functions/rider-photo/index.ts` (Deno)
 - `POST { token, paths? }` -> `{ photos: { "<path>": "/storage/v1/object/sign/claims/...?token=..." } }`.
@@ -340,7 +368,7 @@ Security definer, callable by anon.
 
 ### 4.10 `supabase/reset.sql`
 
-Drops the three storage policies, `rider_photo_paths(uuid)`, the views (`claim_activity, rider_activity, claims_detail, rider_scores,
+Drops the six storage policies, `rider_photo_paths(uuid)`, the admin functions, the views (`claim_activity, rider_activity, claims_detail, rider_scores,
 approved_effective, approved_direct`), the tables, every function with its full signature, and the `claim_events`
 type, all with `if exists ... cascade`. Comment notes photos in the bucket are not deleted.
 
@@ -366,7 +394,8 @@ iss `supabase-demo`).
 ### 5.2 `lib.js` exports
 - `configured`: false if URL contains `YOUR-PROJECT-REF` or key starts with `YOUR-`.
 - `sb = createClient(URL, KEY, { auth: { persistSession: true, detectSessionInUrl: true } })`
-- `BUCKET = 'claims'`, `$(sel, root)`, `esc(v)` (escapes `& < > " '`)
+- `BUCKET = 'claims'`, `REF_BUCKET = 'bonus-photos'`, `refPhotoUrl(path)` (public link, '' for none),
+  `$(sel, root)`, `esc(v)` (escapes `& < > " '`)
 - `fmtTime(v)`: locale string, month short, day, hour, 2-digit minute; '' for empty.
 - `errorText(err)`: network errors (`Failed to fetch|NetworkError|Load failed|network`) become
   `'No signal or the server could not be reached. Your entry is kept - try again when you have coverage.'`;
@@ -379,7 +408,7 @@ iss `supabase-demo`).
   On any failure (e.g. HEIC on Android) return the original file `{blob:file, ext, type, shrunk:false}`.
   Canvas re-encoding drops photo metadata (intended for now).
 - `newId()`: `crypto.randomUUID` with a `getRandomValues` fallback (plain-http testing).
-- `currentScorer()`: `{session, isScorer}` via `sb.auth.getSession()` and `rpc('is_scorer')`.
+- `currentScorer()`: `{session, role, isScorer, isAdmin}` via `sb.auth.getSession()` and `rpc('staff_role')`.
 - `renderLogin(container, onDone)`: "Scorer sign in" card, email field, "Email me a link" button;
   `signInWithOtp({ email (lower), options: { emailRedirectTo: current URL without hash } })`;
   success message `Check <email> for the sign-in link. Open it on this device.`; calls `onDone` on `SIGNED_IN`.
@@ -390,8 +419,9 @@ iss `supabase-demo`).
   Header buttons `.th-sort[data-sort]`; clicking the current column reverses it. Active header gets
   `aria-sort` (CSS draws the arrow). Blank values sort as smallest. Stable sort. Options:
   `sort {key, dir}` default, `store` (localStorage key remembering the sort), `empty` text, `rowClass(row)`.
-- `navBar(active)`: links Review (scorer.html), Activity (activity.html), Admin (admin.html), Leader board; "Sign out" link-button
-  `#sign-out` aligned right. `wireSignOut()` signs out and reloads.
+- `navBar(active, who)`: Review (scorer.html) and Activity (activity.html) for scorers, Admin (admin.html)
+  only for admins, Leader board always; "Sign out" link-button `#sign-out` aligned right when signed in.
+  `wireSignOut()` signs out and reloads.
 
 ### 5.3 `index.html`
 Title "Rally Scoring". Card: "Riders: use the personal link the rally staff sent you." and links to
@@ -417,7 +447,9 @@ leader board, scorer review, activity, admin.
   approved `Approved`; counted `Counted - all parts approved`; pending `Waiting for review`;
   denied `Denied - you can try again` or `Denied - no attempts left`.
 - **Claim view** (tap a bonus): back link "<- All bonuses", code + name, `<pts> pts - X of N attempts used`,
-  description, then **Your submissions** (`#c-history`, hidden when the bonus has no history): one item
+  description, a **Show reference photo** button when the bonus has `ref_photo` (loads the public link
+  on tap into `#c-ref-img`; toggles to "Hide reference photo"; load failure shows a message and resets),
+  then **Your submissions** (`#c-history`, hidden when the bonus has no history): one item
   per history entry, newest first: status badge (`Approved` / `Waiting for review` / `Denied`),
   `sent <time>` plus ` by rally staff` when `by_staff`, `Reason: <reason>` for denied ones, and either
   `No photo` / `No photo (combo)` or a **Show photo** button. Tapping it calls
@@ -447,18 +479,24 @@ leader board, scorer review, activity, admin.
   (digits = rider number exact, else bonus code prefix via `ilike`), debounced 300 ms; Refresh button.
 - Pending: `claims_detail` where pending, oldest first. Decided: not pending, `decided_at` desc, limit 100.
   Photos via `createSignedUrls(paths, 3600)`. Empty: `Nothing waiting. Nice.` / `No decisions yet.`
-- Claim card: 140px thumbnail (click opens a `<dialog id="zoom">` with full image), or
+- Claim card: 140px thumbnail, or
   `Combo - no photo needed` / `No photo`; code, name, points, rider number and name,
   `Submitted <time> by <who>` plus `- photo file time <time>`, note, and for decided claims a status
   badge, decider, time and reason.
+- **Claim dialog** (`<dialog id="claim-dlg">`): clicking a claim photo or its bonus title (cards and
+  table) opens it: code, name, points, rider, submitted time and by, note, then **Submitted photo** and
+  **Reference photo** side by side (stacked under 640px; each opens full size in a new tab), or
+  `No reference photo for this bonus. An admin can add one.`, decided line, and the same actions as the
+  card. Deny without reason warns inside the dialog. A decision closes the dialog and refreshes.
+  Auto-refresh is skipped while the dialog is open.
 - Pending actions: Approve (green), reason input (placeholder says the rider sees it), Deny (red). Deny without a reason focuses the input
   and warns `'Enter a reason to deny.'`. Decided: "Revert to pending". All via `rpc('scorer_decide')`.
 - Auto-refresh every 20 s when the page is visible and on the Pending tab, skipped while any reason
   input has text or focus (a redraw would wipe a half-typed reason).
 - **Cards / Table** switch (`#view-switch`, remembered as `review_view`). Table view (Pending and
   Decided) uses `sortableTable`, widens the page (`main.wide`), and keeps the same `data-act`,
-  `data-reason`, `data-zoom` attributes so the same click handler decides and zooms. Only one view
-  holds action inputs at a time.
+  `data-reason`, `data-open` attributes so the same click handler decides and opens the dialog. The
+  reason is read from the same card, row or dialog as the button.
   - Pending columns: Photo (44px thumb, or combo/none), Submitted, Rider, Name, Bonus, Points, By,
     Photo time, Note, Decide (Approve / reason input / Deny). Default sort Submitted ascending.
   - Decided columns: Photo, Decided, Status badge, Rider, Name, Bonus, Points, Decided by, Reason,
@@ -481,14 +519,16 @@ leader board, scorer review, activity, admin.
   - Riders: `rider_activity`. Columns #, Name, Last seen, Claims, Pending, Approved, Denied, Last claim,
     Score. Rows with no `last_seen_at` get class `attention` (highlighted). Help text: highlighted riders
     have never opened their link. Default sort # ascending.
-  - Scorers: `rpc('scorer_list')`. Columns Email, Last sign-in.
+  - Scorers: `rpc('scorer_list')`. Columns Email, Role (admin / scorer), Last sign-in.
 - Times show `ago()`: `never`, `just now`, `<n> min ago`, `<h> h <m> min ago` under 6 hours, else `fmtTime`;
   full time in the cell `title`. Sorts remembered as `activity_sort_feed|riders|scorers`.
 - Activity is recorded by the database only: claim events (trigger), rider visits (`rider_session`),
   scorer sign-ins (Supabase Auth). Supabase's own logs are not used.
 
 ### 5.6 `admin.html`
-- Loads PapaParse. Same sign-in / not-scorer handling (`Not on the scorer list.`).
+- Loads PapaParse. `main.wide`. Not signed in -> `renderLogin`. Scorer but not admin -> nav +
+  `The admin page is for rally admins only. You can review claims on the Review page.` Not a scorer ->
+  `<email> is not on the scorer list.` The database enforces the same (RLS and `require_admin`).
 - **Event** card: event name, attempts allowed (1-10), claims open checkbox; Save updates `settings` id 1.
 - **Import from CSV** card, one section per kind with file input, Import button (disabled until valid)
   and preview. Header matching is case-insensitive; first alias is the Google Sheets header:
@@ -506,17 +546,36 @@ leader board, scorer review, activity, admin.
   (`...and N more`) or `<n> rows look good. Click Import.`, plus an 8-row preview table.
   Normalize: emails lower case, codes upper case, bonus `sort_order` = file row order.
 - Import: riders `upsert` on `rider_number` (tokens stay the same); bonuses `upsert` on `code`;
-  combos delete all then insert (replaced as a whole). Result: `Imported <n> <kind>.`
+  combos delete all then insert (replaced as a whole). Result: `Imported <n> <kind>.`, then lists reload.
   Help text: import bonuses before combos.
-- **Rider links** card: table `# / Name / Link (open) / New link`; link = `rider.html?t=<token>`
-  resolved against the current page URL. "Download links as CSV" (PapaParse unparse) ->
-  `rider-links.csv` with `Rider Number, Name, Email, Link`. "New link" calls `scorer_new_token`.
-  Empty: `Import riders first.`
-- **Testing reset** card: text input `Type DELETE ALL CLAIMS`, red "Delete all claims" button ->
-  `scorer_delete_all_claims`; shows `Deleted <n> claims.` Explains riders, bonuses, links and photos are kept.
+- Lists use `sortableTable` (sorts remembered as `admin_sort_riders|bonuses|combos`). Each list card
+  has its own message box; an action's result is shown after the lists reload.
+- **Riders** card: "Add rider", "Download links as CSV" (PapaParse unparse -> `rider-links.csv` with
+  `Rider Number, Name, Email, Link`). Columns #, Name, Email, Link (`open`, `rider.html?t=<token>`
+  resolved against the page URL), Edit / New link (confirm; `scorer_new_token`) / Delete (confirm
+  `Delete rider <n> <name> and all of their claims?`).
+- **Bonuses** card: "Add bonus". Columns Photo (thumb linking to the full photo, or `none`), Code, Name,
+  Points, Order, Description, Edit / Delete. Delete (confirm) removes the row and its photo file; a
+  bonus with claims fails (FK 23503) with `Bonus <CODE> has claims, so it cannot be deleted. Delete its
+  claims first (Delete -> All claims).`
+- **Combos** card: "Add combo". Columns Combo, Name, Points, Bonuses in it, Edit / Delete (confirm;
+  `admin_set_combo(code, [])`; the combo bonus stays).
+- **Edit dialog** (`<dialog id="edit">`, one form): Save / Cancel; errors shown inside; on success it
+  closes and the lists reload. Duplicate key (23505) -> `<thing> is already used.`
+  - Rider: number (whole, > 0), name, email (lower case). Insert, or update by `id`.
+  - Bonus: code (read-only when editing: renaming is delete + add), name, points (whole), order,
+    description, reference photo file (shrunk with `shrinkImage`, uploaded to `bonus-photos/<CODE>/<uuid>.<ext>`),
+    current photo with "Remove the reference photo" checkbox. The old file is deleted after the row
+    saves when replaced or removed.
+  - Combo: combo code (read-only when editing; datalist of bonus codes), members as codes separated by
+    commas or spaces -> `rpc('admin_set_combo')`.
+- **Delete** card: select All claims / All riders / All bonuses / All combos with help text for each,
+  input placeholder `Type DELETE ALL <KIND>`, red `Delete all <kind>` button. Claims ->
+  `scorer_delete_all_claims`, others -> `admin_delete_all`. Shows `Deleted <n> <kind>` (singular for 1).
 
 ### 5.7 `leaderboard.html`
-Public. Title "Leader board". Table: Finish, Rider, Name, Bonuses (right), Score (right, bold), large text.
+Public. Title "Leader board". A signed-in scorer or admin also gets `navBar` (`#nav`); everyone else sees
+no staff links. Table: Finish, Rider, Name, Bonuses (right), Score (right, bold), large text.
 `rpc('leaderboard')`; line `Updated <time> - refreshes every 30 seconds`; refresh every 30 s when visible.
 
 ### 5.8 `styles.css`
@@ -529,7 +588,8 @@ accent, ok/warn/err + backgrounds, info-bg). `[hidden] { display:none !important
 `.score-card`, `.score-total` (2rem), `.check`, `.group-head` (uppercase muted heading),
 `table.data` (dense 0.9rem, sticky header, `td.wrap` for long text, `img.thumb` 44px, `.row-actions`),
 `.th-sort` with `aria-sort` arrows, `tr.attention` (warn background), `.wide` (max-width 1280px),
-`.tiles` / `.tile` (activity counters), `.view-switch`, `h3`, `.history-item` (rider submissions).
+`.tiles` / `.tile` (activity counters), `.view-switch`, `h3`, `.history-item` (rider submissions),
+`dialog.editor` (admin edit form), `dialog.compare` + `.compare-photos` (scorer claim dialog), `button.open-claim`.
 
 ---
 
@@ -581,11 +641,11 @@ anon/authenticated, **no default table grants** (schema.sql must grant itself).
 
 ### 7.2 `tests/schema.test.mjs` (PGlite)
 Load stubs then the real `supabase/schema.sql`. Helpers switch role with `set role` and set
-`request.jwt.claims` for scorer / non-scorer emails. Note: use `select * from fn()`, not
+`request.jwt.claims` for admin / scorer / non-scorer emails. Note: use `select * from fn()`, not
 `select (fn()).*` (the latter calls fn once per column). Tests:
 1. bonus code format is enforced
 2. anon key alone cannot read tables
-3. table grants: scorers can do what the admin page does; non-scorers see nothing
+3. table grants: admins can do what the admin page does; non-scorers see nothing
 4. rider session lists bonuses but hides penalties
 5. rider submit rules (unknown code, penalty code, photo required, wrong photo folder, retries by
    client id, max attempts, already approved)
@@ -599,7 +659,14 @@ Load stubs then the real `supabase/schema.sql`. Helpers switch role with `set ro
 11. rider sees own submission history; photo lookup is for the Edge Function only (history newest
     first with staff flag and reason; `rider_photo_paths` only this rider's paths, refused for anon and
     scorers; anon cannot list storage)
-12. reset.sql removes everything (then schema.sql reloads cleanly)
+12. scorers review; only admins change the event setup (`staff_role`; scorers read setup but writes
+    are refused or touch no rows; admin functions refused; scorers still add and decide claims)
+13. admin: edit a combo, reference photos, delete everything (`admin_set_combo` checks and
+    normalizing; `ref_photo` in rider_session and `bonus_ref_photo` in claims_detail; only admins upload
+    to or list `bonus-photos`; `admin_delete_all` phrases and what each deletes or keeps)
+14. existing scorers become admins when the admin column is first added (and a re-run does not promote
+    later scorers)
+15. reset.sql removes everything (then schema.sql reloads cleanly)
 
 ### 7.3 `tests/web.test.mjs` (Playwright Chromium)
 - If `tmp/supabase.esm.js` is missing, bundle it:
@@ -621,7 +688,12 @@ Load stubs then the real `supabase/schema.sql`. Helpers switch role with `set ro
   8. activity: tiles, claim feed, riders never seen, scorer sign-ins
   9. scorer: signed-out user gets the email login; non-scorer is told so
   10. admin: CSV import validates, then upserts riders with the sheet column names
-  11. leader board renders scores
+  11. leader board renders scores (no staff links for the public; a signed-in scorer gets them)
+  12. rider: reference photo shows on tap
+  13. scorer: claim dialog shows the submitted and reference photos and decides from there
+  14. admin page is for admins only
+  15. admin: edit riders, bonuses with a reference photo, combos; delete all
+  Scorer tests also check the nav has no Admin link for a plain scorer.
 
 All tests must pass with `npm test` before the work is called done.
 
@@ -671,7 +743,7 @@ ARSN,WXYZ
 
 ## 10. Done when
 
-1. `npm install && npm run test:setup && npm test` passes all 23 tests.
+1. `npm install && npm run test:setup && npm test` passes all 30 tests.
 2. Pasting `schema.sql` into a fresh Supabase project runs without errors, and running it twice is harmless.
 3. Following README setup with the `samples/` CSVs, a rider can submit from a phone, a scorer can
    approve, and the leader board shows the score (ABCD + WXYZ approved = 175 with combo ARSN).
