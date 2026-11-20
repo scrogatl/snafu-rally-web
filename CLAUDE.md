@@ -36,6 +36,9 @@ the code when behavior changes. Setup steps for people: `README.md`.
 ## Decisions
 - Bonus codes: 4 letters, or 3 letters + 1 digit, upper case (DB check constraint).
 - Max attempts per bonus: setting, default 3.
+- Admin flags `rider_sees_score` / `rider_sees_status` hide the score or the results (all "received")
+  from riders. `rider_session` does the hiding, not the page. Hiding the score also makes `leaderboard()`
+  refuse anyone who is not a scorer.
 - Photos are shrunk on the phone (~1600 px JPEG) before upload; metadata is not kept for now.
 - TABLED: location check against bonus coordinates. Plan when resumed: capture device GPS at photo time
   in the app (EXIF GPS is unreliable from mobile browsers), compute distance in the DB, flag for the

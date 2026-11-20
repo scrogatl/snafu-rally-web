@@ -278,6 +278,49 @@ test('rider sees own submission history; photo lookup is for the Edge Function o
   assert.equal((await rider((tx) => tx.query('select * from storage.objects'))).rows.length, 0);
 });
 
+test('admin can hide the score (and leader board) and the results from riders; the database does the hiding', async () => {
+  // Rider 7 already has a denied staff claim (with a reason) and a pending claim for ABC1
+  const c = await scorer((tx) => one(tx, `select * from scorer_add_claim(7, 'ABCD', 'approved')`));
+  const show = async () => (await rider((tx) => one(tx, 'select rider_session($1) as s', [token7]))).s;
+  let s = await show();
+  assert.equal(s.shows_score, true);
+  assert.equal(s.shows_status, true);
+  assert.ok(s.score && s.score.total > 0);
+  assert.equal(s.bonuses.find((b) => b.code === 'ABCD').status, 'approved');
+
+  // A plain scorer cannot change the flags; an admin can
+  assert.equal((await scorer((tx) => tx.query('update settings set rider_sees_score = false'))).affectedRows, 0);
+  await admin((tx) => tx.query('update settings set rider_sees_score = false, rider_sees_status = false'));
+  s = await show();
+  assert.equal(s.shows_score, false);
+  assert.equal(s.shows_status, false);
+  assert.equal(s.score, null);
+  const abcd = s.bonuses.find((b) => b.code === 'ABCD');
+  const abc1 = s.bonuses.find((b) => b.code === 'ABC1');
+  assert.deepEqual([abcd.status, abcd.counted, abcd.history[0].status], ['received', false, 'received']);
+  assert.deepEqual(abc1.history.map((h) => [h.status, h.reason]), [['received', null], ['received', null]]);
+  assert.equal(s.bonuses.find((b) => b.code === 'WXYZ').status, null, 'nothing sent: no status');
+  const text = JSON.stringify(s);
+  for (const word of ['approved', 'denied', 'pending', 'too dark']) assert.ok(!text.includes(word), `${word} hidden`);
+  // Sending an approved bonus again is still refused, without saying it was approved
+  await rejects(rider((tx) => tx.query('select rider_submit($1,$2,$3,$4,null,null)', [token7, uuid(), 'ABCD', `${token7}/again.jpg`])),
+    /ABCD was already received/);
+  // Scorers still see everything, including the leader board; the public board is hidden
+  assert.equal((await scorer((tx) => one(tx, 'select status from claims where id = $1', [c.id]))).status, 'approved');
+  assert.ok((await scorer((tx) => tx.query('select * from leaderboard()'))).rows.length > 0);
+  await rejects(rider((tx) => tx.query('select * from leaderboard()')), /leader board is hidden/);
+  await rejects(as('authenticated', 'random@example.com', (tx) => tx.query('select * from leaderboard()')), /leader board is hidden/);
+  // Hiding only the results keeps the board public
+  await admin((tx) => tx.query('update settings set rider_sees_score = true'));
+  assert.ok((await rider((tx) => tx.query('select * from leaderboard()'))).rows.length > 0);
+
+  await admin((tx) => tx.query('update settings set rider_sees_score = true, rider_sees_status = true'));
+  await rejects(rider((tx) => tx.query('select rider_submit($1,$2,$3,$4,null,null)', [token7, uuid(), 'ABCD', `${token7}/again.jpg`])),
+    /already approved for you/);
+  await scorer((tx) => tx.query(`select scorer_decide($1, 'pending')`, [c.id]));
+  await scorer((tx) => tx.query(`select scorer_decide($1, 'denied', 'undo')`, [c.id]));
+});
+
 test('scorers review; only admins change the event setup', async () => {
   assert.equal((await scorer((tx) => one(tx, 'select staff_role() r'))).r, 'scorer');
   assert.equal((await admin((tx) => one(tx, 'select staff_role() r'))).r, 'admin');

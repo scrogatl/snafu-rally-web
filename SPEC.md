@@ -126,6 +126,8 @@ Supabase SQL Editor and Run; safe to re-run; run reset.sql first to start over.
 - `event_name text not null default 'SNAFU Rally'`
 - `max_attempts int not null default 3 check (max_attempts between 1 and 10)`
 - `claims_open boolean not null default true`
+- `rider_sees_score boolean not null default true` (added with `add column if not exists`)
+- `rider_sees_status boolean not null default true` (off: riders see every submission as "received")
 - Seed: `insert into settings (id) values (1) on conflict do nothing;`
 
 **scorers**
@@ -249,8 +251,10 @@ Scoring rule (matches the old sheet): sum of approved positive bonuses, then mul
 `riders.last_seen_at = now()` when it is null or older than 1 minute (keeps writes low), then returns:
 ```
 { event_name, claims_open, max_attempts,
+  shows_score, shows_status,       // settings.rider_sees_score / rider_sees_status
   rider: { number, name },
-  score: { total, base_points, worst_penalty, bonuses_counted },   // from rider_scores, 0 defaults
+  score: { total, base_points, worst_penalty, bonuses_counted },   // from rider_scores, 0 defaults;
+                                   // null when rider_sees_score is off
   bonuses: [ { code, name, points, description, is_combo, ref_photo,   // ref_photo = ref_photo_path
                counted,      // in approved_effective for this rider
                attempts,     // count of this rider's claims for the bonus
@@ -260,6 +264,9 @@ Scoring rule (matches the old sheet): sum of approved positive bonuses, then mul
                              // this rider's claims for the bonus, newest first;
                              // by_staff = submitted_by not like 'rider %'
 ```
+When `rider_sees_status` is off the database hides the results: `status` is `'received'` for any bonus
+with claims (null without), `counted` is always false, and each history item has status `'received'`
+and reason null.
 Bonuses: only `points >= 0` (penalties hidden from riders), ordered `sort_order nulls last, code`.
 
 **`rider_photo_paths(p_token uuid) returns text[]`** (stable, security definer, **service_role only**):
@@ -277,7 +284,8 @@ p_note text default null, p_taken_at timestamptz default null) returns json`** (
 5. No photo and not a combo: `'A photo is required for bonus %.'`
 6. Photo path not exactly `<token>/<name>.<ext>` (name `[0-9A-Za-z_-]+`, ext 1-5 letters/digits; so no
    other folder, sub folder or `..`): `'Photo does not belong to this rider.'`
-7. Already approved: `'Bonus % is already approved for you.'`
+7. Already approved: `'Bonus % is already approved for you.'`; when `rider_sees_status` is off the
+   wording is `'Bonus % was already received. No need to send it again.'`
 8. Attempts >= max: `'You have used all % attempts for bonus %. See rally staff.'`
 9. Insert with `note = nullif(trim(p_note), '')`, `submitted_by = 'rider ' || rider_number`.
    Return `{claim_id, status: 'pending', duplicate: false}`.
@@ -286,7 +294,9 @@ p_note text default null, p_taken_at timestamptz default null) returns json`** (
 
 **`leaderboard() returns table (finish bigint, rider_number int, name text, score numeric,
 bonuses_counted bigint)`**: `rank() over (order by score desc)`, ordered by finish then rider_number.
-Security definer, callable by anon.
+Security definer (plpgsql), callable by anon. When `rider_sees_score` is off and the caller is not a
+scorer it raises `'The leader board is hidden until the results are announced.'` (P0001); scorers and
+admins still get the board.
 
 ### 4.7 Scorer and admin functions (security definer; `require_scorer()` first unless marked admin)
 
@@ -468,6 +478,10 @@ leader board, scorer review, activity, admin.
   preview image, optional note (max 500), big "Submit bonus" button.
   Blocked (form hidden, warn shown): claims closed; already approved; combo already counted;
   out of attempts (`'You have used all attempts for this bonus. See rally staff.'`).
+- **Hidden results** (admin flags): `score` null hides the score card. Status `'received'` shows a
+  `Received` badge (`.badge.received`), counts as Claimed (not To get), and the bonus page shows
+  `You sent this bonus already. Send it again only if rally staff ask you to.` with the form still
+  available (the rider cannot tell a denied one). The success message is just `Received: <CODE>.`
 - **Submit flow (retry-safe)**: choosing a photo creates a `draft = {clientId: newId(), file, uploadedPath: null}`.
   On submit: require photo unless combo (`'Add a photo first.'`); disable button;
   (1) if not yet uploaded: "Preparing photo..." -> shrink -> "Uploading photo..." -> upload to
@@ -475,13 +489,14 @@ leader board, scorer review, activity, admin.
   `uploadedPath`; (2) "Submitting..." -> `rpc('rider_submit', {...})` with `p_taken_at` from
   `file.lastModified`. On error keep the draft and show `errorText` (so tapping Submit again does not
   re-upload and reuses the same client id). On success: reload session, return to list, show
-  `Received: <CODE>. It will show as approved once a scorer reviews it.`
+  `Received: <CODE>. It will show as approved once a scorer reviews it.` (or `Received: <CODE>.` when
+  results are hidden).
 - `online` event: `'Signal is back - you can submit now.'`
 - On `visibilitychange` to visible, reload session only when the list view is showing.
 
 ### 5.5 `scorer.html`
 - Not signed in -> `renderLogin`. Signed in but not scorer -> nav + `<email> is not on the scorer list. Ask the organizer to add it.`
-- Heading "Review claims"; tabs `Pending (count)`, `Decided`, `Add claim`; filter box
+- Heading "Review claims"; tabs `Pending (count)`, `Decided`, `Add claim`, `Rider summary`; filter box
   (digits = rider number exact, else bonus code prefix via `ilike`), debounced 300 ms; Refresh button.
 - Pending: `claims_detail` where pending, oldest first. Decided: not pending, `decided_at` desc, limit 100.
   Photos via `createSignedUrls(paths, 3600)`. Empty: `Nothing waiting. Nice.` / `No decisions yet.`
@@ -512,6 +527,16 @@ leader board, scorer review, activity, admin.
 - Add claim tab: rider number, bonus select (all bonuses incl. penalties: `CODE - name (points)`),
   status select (Approve now / Add as pending), note, optional photo (shrunk, uploaded to `scorer/<uuid>.<ext>`),
   `rpc('scorer_add_claim')`. Help text: "For riders who could not submit themselves, penalties, or checkpoint entries."
+- **Rider summary** tab, to print and hand to a rider: rider select (`<number> - <name>`, remembered as
+  `summary_rider`) and a Print button (`window.print()`, disabled until a rider is picked; with none:
+  `Pick a rider to see their claims and score.`). The sheet: `<event name> - rider summary`, rider,
+  printed time, total score (`rider_scores.score`), then a table of every claim from `claims_detail`
+  for that rider in the order sent (`submitted_at` ascending), penalties included: Check (a check box),
+  #, Sent, Bonus (code + name), Points, Result (`Approved` / `Denied` + reason / `Pending`). Combos that
+  count only because all parts are approved (`approved_effective.via_combo`) follow as
+  `Counted (all parts approved)`. With pending claims: `N claim(s) is/are still pending, so this score
+  may change.` Footer: `Approved points <base> [with a <p>% penalty] = <score>` and signature lines.
+  Print styles (`@media print`) hide the nav, tabs, picker and heading and print black on white.
 
 ### 5.5a `activity.html`
 - Same sign-in / not-scorer handling as scorer.html. `main.wide`. Heading "Activity", line
@@ -535,7 +560,9 @@ leader board, scorer review, activity, admin.
 - Loads PapaParse. `main.wide`. Not signed in -> `renderLogin`. Scorer but not admin -> nav +
   `The admin page is for rally admins only. You can review claims on the Review page.` Not a scorer ->
   `<email> is not on the scorer list.` The database enforces the same (RLS and `require_admin`).
-- **Event** card: event name, attempts allowed (1-10), claims open checkbox; Save updates `settings` id 1.
+- **Event** card: event name, attempts allowed (1-10), claims open checkbox, and "Rider page shows":
+  **Score** (`rider_sees_score`; off also hides the public leader board) and **Approved / denied and deny reasons** (`rider_sees_status`; off:
+  every submission shows as "Received"); Save updates `settings` id 1.
 - **Import from CSV** card, one section per kind with file input, Import button (disabled until valid)
   and preview. Header matching is case-insensitive; first alias is the Google Sheets header:
 
@@ -583,6 +610,8 @@ leader board, scorer review, activity, admin.
 Public. Title "Leader board". A signed-in scorer or admin also gets `navBar` (`#nav`); everyone else sees
 no staff links. Table: Finish, Rider, Name, Bonuses (right), Score (right, bold), large text.
 `rpc('leaderboard')`; line `Updated <time> - refreshes every 30 seconds`; refresh every 30 s when visible.
+A P0001 error (board hidden) shows as an info message with the table (`#board`) hidden; other errors
+show as errors.
 
 ### 5.8 `styles.css`
 CSS variables with light and `prefers-color-scheme: dark` palettes (bg, card, text, muted, line,
@@ -672,9 +701,14 @@ Load stubs then the real `supabase/schema.sql`. Helpers switch role with `set ro
 13. admin: edit a combo, reference photos, delete everything (`admin_set_combo` checks and
     normalizing; `ref_photo` in rider_session and `bonus_ref_photo` in claims_detail; only admins upload
     to or list `bonus-photos`; `admin_delete_all` phrases and what each deletes or keeps)
-14. existing scorers become admins when the admin column is first added (and a re-run does not promote
+14. admin can hide the score and the results from riders; the database does the hiding (score null,
+    every status `received`, no reasons, no `counted`, no result words anywhere in the JSON; the
+    already-approved refusal does not say approved; scorers cannot change the flags; the leader board
+    is refused for anon and non-scorers while scores are hidden, still works for scorers, and comes
+    back when only results are hidden)
+15. existing scorers become admins when the admin column is first added (and a re-run does not promote
     later scorers)
-15. reset.sql removes everything (then schema.sql reloads cleanly)
+16. reset.sql removes everything (then schema.sql reloads cleanly)
 
 ### 7.3 `tests/web.test.mjs` (Playwright Chromium)
 - If `tmp/supabase.esm.js` is missing, bundle it:
@@ -696,11 +730,16 @@ Load stubs then the real `supabase/schema.sql`. Helpers switch role with `set ro
   8. activity: tiles, claim feed, riders never seen, scorer sign-ins
   9. scorer: signed-out user gets the email login; non-scorer is told so
   10. admin: CSV import validates, then upserts riders with the sheet column names
-  11. leader board renders scores (no staff links for the public; a signed-in scorer gets them)
+  11. leader board renders scores (no staff links for the public; a signed-in scorer gets them; when
+      hidden, an info message and no table)
   12. rider: reference photo shows on tap
   13. scorer: claim dialog shows the submitted and reference photos and decides from there
   14. admin page is for admins only
   15. admin: edit riders, bonuses with a reference photo, combos; delete all
+  16. rider: admin can hide the score and results; then the page says only "Received"
+  17. admin: rider page flags load and save
+  18. scorer: printable rider summary lists claims in the order sent, with the score (check boxes,
+      auto-counted combo row, print media hides the controls, rider choice remembered)
   Scorer tests also check the nav has no Admin link for a plain scorer.
 
 ### 7.4 `tests/security.test.mjs`
@@ -729,7 +768,7 @@ riders 1 and 2. Browser parts use `tests/browser.mjs`. Tests:
 - config script: refuses service_role and `sb_secret_` keys without echoing them; never prints a password
   from a URL; accepts anon and publishable keys.
 - pages: a hostile string (`"'><img src=x onerror=...><script>...`) as event name, names, notes, reasons,
-  emails, actions and error messages renders as text on rider, review (cards, table, dialog, add form),
+  emails, actions and error messages renders as text on rider, review (cards, table, dialog, add form, rider summary),
   activity, admin (lists and edit fields) and leader board pages; nothing runs.
 
 All tests must pass with `npm test` before the work is called done.
@@ -780,7 +819,7 @@ ARSN,WXYZ
 
 ## 10. Done when
 
-1. `npm install && npm run test:setup && npm test` passes all 51 tests.
+1. `npm install && npm run test:setup && npm test` passes all 55 tests.
 2. Pasting `schema.sql` into a fresh Supabase project runs without errors, and running it twice is harmless.
 3. Following README setup with the `samples/` CSVs, a rider can submit from a phone, a scorer can
    approve, and the leader board shows the score (ABCD + WXYZ approved = 175 with combo ARSN).

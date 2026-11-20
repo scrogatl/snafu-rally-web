@@ -94,11 +94,13 @@ const statusLabel = {
   approved: ['approved', 'Approved'],
   pending: ['pending', 'Waiting for review'],
   denied: ['denied', 'Denied - you can try again'],
+  // The admin can hide results from riders; then every submission is just "received"
+  received: ['received', 'Received'],
 };
 
 // Photos of past submissions: path -> signed link (null = file not found). Kept for this visit only.
 const photoUrls = {};
-const historyLabel = { approved: 'Approved', pending: 'Waiting for review', denied: 'Denied' };
+const historyLabel = { approved: 'Approved', pending: 'Waiting for review', denied: 'Denied', received: 'Received' };
 
 function renderHistory() {
   const h = current.history || [];
@@ -153,13 +155,14 @@ function badgeFor(b) {
   if (b.counted) return ['approved', 'Counted - all parts approved'];
   if (b.status === 'pending') return statusLabel.pending;
   if (b.status === 'denied') return outOfAttempts(b) ? ['denied', 'Denied - no attempts left'] : statusLabel.denied;
+  if (b.status === 'received') return statusLabel.received;
   return ['', ''];
 }
 
 // "Claimed" = the rider has sent it: approved, counted, waiting for review, or denied.
 // A denied bonus with attempts left can be sent again, so it is also "to get".
 const isClaimed = (b) => b.counted || b.status === 'approved' || b.status === 'pending' ||
-  b.status === 'denied';
+  b.status === 'denied' || b.status === 'received';
 const canRetry = (b) => b.status === 'denied' && !b.counted && !outOfAttempts(b);
 const isToGet = (b) => !isClaimed(b) || canRetry(b);
 
@@ -280,6 +283,9 @@ function openClaim(code, keepDraft = false) {
   else if (current.attempts >= session.max_attempts) blocked = 'You have used all attempts for this bonus. See rally staff.';
   showMessage($('#c-blocked'), blocked, 'warn');
   $('#claim-form').hidden = !!blocked && !keepDraft;
+  if (!blocked && current.status === 'received') {
+    showMessage($('#c-blocked'), 'You sent this bonus already. Send it again only if rally staff ask you to.');
+  }
 
   $('#list-view').hidden = true;
   $('#claim-view').hidden = false;
@@ -374,7 +380,8 @@ $('#claim-form').addEventListener('submit', async (ev) => {
     draft = null; current = null;
     $('#claim-view').hidden = true;
     await load();
-    showMessage($('#page-msg'), `Received: ${code}. It will show as approved once a scorer reviews it.`, 'ok');
+    showMessage($('#page-msg'), session.shows_status === false ? `Received: ${code}.`
+      : `Received: ${code}. It will show as approved once a scorer reviews it.`, 'ok');
     window.scrollTo(0, 0);
   } catch (e) {
     showMessage(msg, errorText(e), 'error');

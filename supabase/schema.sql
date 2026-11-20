@@ -25,6 +25,11 @@ create table if not exists settings (
   claims_open   boolean not null default true
 );
 insert into settings (id) values (1) on conflict do nothing;
+-- What riders see on their page. Off = hidden by the database, not just the page.
+--   rider_sees_score:  their total score
+--   rider_sees_status: approved / denied (and deny reasons); off = every submission shows as "received"
+alter table settings add column if not exists rider_sees_score  boolean not null default true;
+alter table settings add column if not exists rider_sees_status boolean not null default true;
 
 -- ---------------------------------------------------------------------------
 -- Tables
@@ -298,7 +303,7 @@ create or replace view rider_activity with (security_invoker = true) as
 -- ---------------------------------------------------------------------------
 create or replace function rider_session(p_token uuid) returns json
 language plpgsql volatile security definer set search_path = public as $$
-declare r riders; s settings; sc rider_scores;
+declare r riders; s settings; sc rider_scores; v_status boolean;
 begin
   r := rider_from_token(p_token);
   -- Record the visit for the activity page (at most once a minute per rider, to keep writes low)
@@ -306,34 +311,46 @@ begin
    where id = r.id and (last_seen_at is null or last_seen_at < now() - interval '1 minute');
   select * into s from settings where id = 1;
   select * into sc from rider_scores where rider_id = r.id;
+  v_status := s.rider_sees_status;
   return json_build_object(
     'event_name',   s.event_name,
     'claims_open',  s.claims_open,
     'max_attempts', s.max_attempts,
+    'shows_score',  s.rider_sees_score,
+    'shows_status', v_status,
     'rider',        json_build_object('number', r.rider_number, 'name', r.name),
-    -- Official score, same numbers as the leader board (approved only, penalties applied)
-    'score',        json_build_object('total', coalesce(sc.score, 0), 'base_points', coalesce(sc.base_points, 0),
-                                      'worst_penalty', sc.worst_penalty, 'bonuses_counted', coalesce(sc.bonuses_counted, 0)),
+    -- Official score, same numbers as the leader board (approved only, penalties applied).
+    -- Null when the admin hides scores from riders.
+    'score',        case when s.rider_sees_score then
+                      json_build_object('total', coalesce(sc.score, 0), 'base_points', coalesce(sc.base_points, 0),
+                                        'worst_penalty', sc.worst_penalty, 'bonuses_counted', coalesce(sc.bonuses_counted, 0))
+                    end,
     'bonuses', coalesce((
       select json_agg(json_build_object(
                'code', b.code, 'name', b.name, 'points', b.points,
                'description', b.description, 'is_combo', is_combo(b.code),
                'ref_photo', b.ref_photo_path,
-               -- true when this bonus counts toward the score (approved, or a combo with every part approved)
-               'counted', exists (select 1 from approved_effective e where e.rider_id = r.id and e.bonus_code = b.code),
+               -- true when this bonus counts toward the score (approved, or a combo with every part approved).
+               -- Always false when results are hidden, since it would give them away.
+               'counted', v_status and exists (select 1 from approved_effective e
+                                               where e.rider_id = r.id and e.bonus_code = b.code),
                'attempts', (select count(*) from claims c where c.rider_id = r.id and c.bonus_code = b.code),
                'status', (select case
+                                   when count(*) = 0                   then null
+                                   when not v_status                   then 'received'
                                    when bool_or(c.status = 'approved') then 'approved'
                                    when bool_or(c.status = 'pending')  then 'pending'
-                                   when count(*) > 0                   then 'denied'
+                                   else 'denied'
                                  end
                           from claims c where c.rider_id = r.id and c.bonus_code = b.code),
                -- This rider's submissions for the bonus, newest first. The page shows them with the
                -- photo (signed by the rider-photo Edge Function) and the scorer's reason if denied.
                'history', coalesce((
                  select json_agg(json_build_object(
-                          'status', c.status, 'submitted_at', c.submitted_at, 'photo_path', c.photo_path,
-                          'reason', c.reason, 'by_staff', c.submitted_by not like 'rider %')
+                          'status', case when v_status then c.status::text else 'received' end,
+                          'submitted_at', c.submitted_at, 'photo_path', c.photo_path,
+                          'reason', case when v_status then c.reason end,
+                          'by_staff', c.submitted_by not like 'rider %')
                         order by c.submitted_at desc)
                  from claims c where c.rider_id = r.id and c.bonus_code = b.code), '[]'::json))
              order by b.sort_order nulls last, b.code)
@@ -396,7 +413,11 @@ begin
   end if;
 
   if exists (select 1 from claims where rider_id = r.id and bonus_code = v_code and status = 'approved') then
-    raise exception 'Bonus % is already approved for you.', v_code using errcode = 'P0001';
+    -- Same rule either way; the wording must not reveal an approval the admin has hidden
+    if s.rider_sees_status then
+      raise exception 'Bonus % is already approved for you.', v_code using errcode = 'P0001';
+    end if;
+    raise exception 'Bonus % was already received. No need to send it again.', v_code using errcode = 'P0001';
   end if;
 
   select count(*) into n from claims where rider_id = r.id and bonus_code = v_code;
@@ -419,11 +440,17 @@ end $$;
 create or replace function leaderboard() returns table (
   finish bigint, rider_number int, name text, score numeric, bonuses_counted bigint
 )
-language sql stable security definer set search_path = public as $$
-  select rank() over (order by score desc), rider_number, name, score, bonuses_counted
-  from rider_scores
-  order by 1, rider_number
-$$;
+language plpgsql stable security definer set search_path = public as $$
+begin
+  -- Hiding scores from riders (admin setting) hides the public board too; staff still see it
+  if not (select rider_sees_score from settings where id = 1) and not is_scorer() then
+    raise exception 'The leader board is hidden until the results are announced.' using errcode = 'P0001';
+  end if;
+  return query
+    select rank() over (order by s.score desc), s.rider_number, s.name, s.score, s.bonuses_counted
+    from rider_scores s
+    order by 1, s.rider_number;
+end $$;
 
 -- ---------------------------------------------------------------------------
 -- Scorer functions (logged-in scorer only)

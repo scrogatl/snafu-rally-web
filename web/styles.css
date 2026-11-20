@@ -50,6 +50,7 @@ button:disabled { opacity: 0.55; cursor: default; }
 .badge.approved { background: var(--ok-bg); color: var(--ok); }
 .badge.pending { background: var(--warn-bg); color: var(--warn); }
 .badge.denied { background: var(--err-bg); color: var(--err); }
+.badge.received { background: var(--info-bg); color: var(--accent); }
 .list { list-style: none; margin: 0; padding: 0; }
 .list li { border-bottom: 1px solid var(--line); }
 .list li:last-child { border-bottom: none; }
@@ -121,3 +122,23 @@ dialog.compare { width: min(1100px, 96vw); padding: 16px; }
 button.open-claim { padding: 0; text-align: left; color: inherit; font-weight: inherit; }
 .claim img { cursor: pointer; }
 table.data img.thumb { cursor: pointer; }
+fieldset.plain { border: none; padding: 0; margin: 0; }
+fieldset.plain legend { padding: 0; margin-bottom: 4px; }
+/* Review: printable rider summary */
+.summary-score { text-align: right; }
+table.summary td.tick, table.summary th.tick { width: 52px; text-align: center; }
+table.summary td.tick input { min-height: 0; width: 22px; height: 22px; }
+table.summary tr.denied td { color: var(--muted); }
+.summary-total { font-size: 1.1rem; margin-top: 12px; }
+.signature { margin-top: 28px; color: var(--muted); }
+@page { margin: 14mm; }
+@media print {
+  :root { --bg: #fff; --card: #fff; --text: #000; --muted: #444; --line: #999; color-scheme: light; }
+  body { background: #fff; color: #000; font-size: 12pt; }
+  main, main.wide { max-width: none; padding: 0; }
+  .nav, .tabs, .no-print, h1, #msg, dialog { display: none !important; }
+  .card { border: none; padding: 0; margin: 0; }
+  .badge { background: none !important; color: #000 !important; border: 1px solid #999; }
+  table.summary tr { break-inside: avoid; }
+  .table-wrap { overflow: visible; }
+}

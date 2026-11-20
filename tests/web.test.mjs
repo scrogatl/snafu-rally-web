@@ -419,6 +419,16 @@ test('leader board renders scores', async () => {
   await signedIn.page.goto(`${APP}leaderboard.html`);
   await signedIn.page.locator('nav.nav').waitFor();
   assert.deepEqual(await navLinks(signedIn.page), ['Review', 'Activity', 'Leader board']);
+
+  // Scores hidden by the admin: the public gets a plain message, no empty table
+  const hidden = await newPage({
+    'POST /rest/v1/rpc/leaderboard': () => ({ status: 400,
+      json: { code: 'P0001', message: 'The leader board is hidden until the results are announced.' } }),
+  });
+  await hidden.page.goto(`${APP}leaderboard.html`);
+  await hidden.page.getByText('hidden until the results are announced').waitFor();
+  assert.equal(await hidden.page.isVisible('#board'), false);
+  assert.equal(await hidden.page.getAttribute('#msg', 'class'), 'msg info');
 });
 
 test('rider: reference photo shows on tap', async () => {
@@ -568,5 +578,116 @@ test('admin: edit riders, bonuses with a reference photo, combos; delete all', a
   assert.deepEqual(calls.find((c) => c.key === 'POST /rest/v1/rpc/admin_delete_all').json,
     { p_what: 'riders', p_confirm: 'DELETE ALL RIDERS' });
   if (process.env.SHOTS) { await page.setViewportSize({ width: 1200, height: 900 }); await page.screenshot({ path: 'tmp/admin.png', fullPage: true }); }
+  assert.deepEqual(errors, []);
+});
+
+test('rider: admin can hide the score and results; then the page says only "Received"', async () => {
+  const hidden = () => ({
+    ...session(), shows_score: false, shows_status: false, score: null,
+    bonuses: [
+      { code: 'ABCD', name: 'Old mill', points: 100, is_combo: false, attempts: 0, status: null, counted: false },
+      { code: 'WXYZ', name: 'Covered bridge', points: 50, is_combo: false, attempts: 1, status: 'received', counted: false,
+        history: [{ status: 'received', submitted_at: new Date().toISOString(), photo_path: null, reason: null, by_staff: false }] },
+    ],
+  });
+  const { page, errors } = await newPage({
+    'POST /rest/v1/rpc/rider_session': () => ({ json: hidden() }),
+    'POST /rest/v1/rpc/rider_submit': () => ({ json: { claim_id: 'c3', status: 'pending' } }),
+    'POST /storage/v1/object/claims/': () => ({ json: { Key: 'claims/x' } }),
+  });
+  await page.goto(`${APP}rider.html?t=${TOKEN}`);
+  await page.locator('#bonus-list .badge', { hasText: 'Received' }).waitFor();
+  assert.equal(await page.isVisible('#score-card'), false, 'no score');
+  await page.locator('[data-filter="claimed"]').click();
+  assert.deepEqual(await page.$$eval('#bonus-list [data-code]', (els) => els.map((e) => e.dataset.code)), ['WXYZ']);
+
+  // A received bonus can be sent again (the rider cannot know if it was denied), with a hint
+  await page.getByRole('button', { name: /WXYZ/ }).click();
+  await page.getByText('You sent this bonus already').waitFor();
+  assert.equal(await page.isVisible('#claim-form'), true);
+  assert.equal(await page.locator('#c-history-list .badge').textContent(), 'Received');
+  await page.setInputFiles('#photo', { name: 'p.png', mimeType: 'image/png', buffer: PNG });
+  await page.getByRole('button', { name: 'Submit bonus' }).click();
+  const msg = page.locator('#page-msg');
+  await msg.getByText('Received: WXYZ.').waitFor();
+  assert.ok(!/approved/i.test(await msg.textContent()));
+  assert.deepEqual(errors, []);
+});
+
+test('admin: rider page flags load and save', async () => {
+  const { page, calls } = await newPage({
+    'POST /rest/v1/rpc/staff_role': () => ({ json: 'admin' }),
+    'GET /rest/v1/settings': () => ({ json: { id: 1, event_name: 'SNAFU Test Rally', max_attempts: 3, claims_open: true,
+      rider_sees_score: true, rider_sees_status: false } }),
+    'GET /rest/v1/riders': () => ({ json: [] }),
+    'GET /rest/v1/bonuses': () => ({ json: [] }),
+    'GET /rest/v1/combo_members': () => ({ json: [] }),
+    'PATCH /rest/v1/settings': () => ({ status: 204 }),
+  }, { session: true });
+  await page.goto(`${APP}admin.html`);
+  await page.waitForFunction(() => document.querySelector('#s-name')?.value === 'SNAFU Test Rally');
+  assert.equal(await page.isChecked('#s-score'), true);
+  assert.equal(await page.isChecked('#s-status'), false);
+  await page.uncheck('#s-score');
+  await page.check('#s-status');
+  await page.locator('#settings').getByRole('button', { name: 'Save' }).click();
+  const c = await callMade(page, calls, (x) => x.key === 'PATCH /rest/v1/settings');
+  assert.equal(c.json.rider_sees_score, false);
+  assert.equal(c.json.rider_sees_status, true);
+});
+
+test('scorer: printable rider summary lists claims in the order sent, with the score', async () => {
+  const t = (m) => new Date(Date.UTC(2026, 5, 1, 9, m)).toISOString();
+  const { page, calls, errors } = await newPage({
+    'POST /rest/v1/rpc/staff_role': () => ({ json: 'scorer' }),
+    'GET /rest/v1/bonuses': () => ({ json: [{ code: 'ABCD', name: 'Old mill', points: 100 }, { code: 'WXYZ', name: 'Covered bridge', points: 50 },
+      { code: 'ARSN', name: 'Mill + bridge', points: 25 }] }),
+    'HEAD /rest/v1/claims': () => ({ headers: { 'content-range': '0-0/0' } }),
+    'GET /rest/v1/claims_detail': (c) => ({ json: c.url.searchParams.get('rider_id') === 'eq.5' ? [
+      { id: 'a', rider_id: 5, status: 'approved', bonus_code: 'ABCD', bonus_name: 'Old mill', points: 100, submitted_at: t(1) },
+      { id: 'b', rider_id: 5, status: 'denied', bonus_code: 'WXYZ', bonus_name: 'Covered bridge', points: 50, submitted_at: t(2), reason: 'blurry' },
+      { id: 'c', rider_id: 5, status: 'approved', bonus_code: 'WXYZ', bonus_name: 'Covered bridge', points: 50, submitted_at: t(3) },
+    ] : [] }),
+    'GET /rest/v1/riders': () => ({ json: [{ id: 5, rider_number: 42, name: 'Jane Smith' }, { id: 6, rider_number: 7, name: 'Bob Jones' }] }),
+    'GET /rest/v1/rider_scores': () => ({ json: { rider_id: 5, score: 175, base_points: 175, worst_penalty: null } }),
+    'GET /rest/v1/approved_effective': () => ({ json: [{ bonus_code: 'ARSN' }] }),
+    'GET /rest/v1/settings': () => ({ json: { event_name: 'SNAFU Test Rally' } }),
+  }, { session: true });
+  await page.goto(`${APP}scorer.html`);
+  await page.getByRole('button', { name: 'Rider summary' }).click();
+  await page.getByText('Pick a rider to see').waitFor();
+  assert.equal(await page.isDisabled('#sum-print'), true);
+  await page.selectOption('#sum-rider', '42');
+  await page.locator('.summary-sheet').getByText('Rider 42').waitFor();
+
+  const rows = await page.$$eval('table.summary tbody tr', (trs) => trs.map((tr) =>
+    [...tr.cells].slice(1).map((td) => td.innerText.replace(/\s+/g, ' ').trim())));
+  assert.deepEqual(rows.map((r) => [r[0], r[2], r[3], r[4]]), [
+    ['1', 'ABCD Old mill', '100', 'Approved'],
+    ['2', 'WXYZ Covered bridge', '50', 'Denied blurry'],
+    ['3', 'WXYZ Covered bridge', '50', 'Approved'],
+    ['4', 'ARSN Mill + bridge', '25', 'Counted (all parts approved)'],
+  ]);
+  assert.equal(await page.locator('table.summary tbody input[type="checkbox"]').count(), 4);
+  assert.equal(await page.locator('.summary-score .score-total').textContent(), '175');
+  assert.match(await page.locator('.summary-total').textContent(), /Approved points 175 = 175/);
+  assert.ok(calls.some((c) => c.key === 'GET /rest/v1/claims_detail' && c.url.searchParams.get('order') === 'submitted_at.asc'));
+
+  if (process.env.SHOTS) {
+    await page.setViewportSize({ width: 900, height: 700 });
+    await page.screenshot({ path: 'tmp/summary.png', fullPage: true });
+    await page.pdf({ path: 'tmp/summary.pdf', format: 'Letter' });
+  }
+  // Printing hides the page controls and keeps the sheet
+  await page.emulateMedia({ media: 'print' });
+  assert.equal(await page.isVisible('nav.nav'), false);
+  assert.equal(await page.isVisible('#sum-rider'), false);
+  assert.equal(await page.isVisible('table.summary'), true);
+  await page.emulateMedia({ media: 'screen' });
+
+  // The choice is remembered on this device
+  await page.reload();
+  await page.getByRole('button', { name: 'Rider summary' }).click();
+  await page.locator('.summary-sheet').getByText('Rider 42').waitFor();
   assert.deepEqual(errors, []);
 });

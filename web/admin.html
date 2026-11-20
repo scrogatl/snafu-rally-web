@@ -57,6 +57,11 @@ async function start() {
         <label class="stack"><span>Event name</span><input type="text" id="s-name" required></label>
         <label class="stack"><span>Attempts allowed per bonus</span><input type="number" id="s-max" min="1" max="10" required></label>
         <label class="row"><input type="checkbox" id="s-open" style="min-height:0;width:auto"> <span>Claims open</span></label>
+        <fieldset class="stack plain"><legend>Rider page shows</legend>
+          <label class="row"><input type="checkbox" id="s-score" style="min-height:0;width:auto"> <span>Score (off also hides the public leader board)</span></label>
+          <label class="row"><input type="checkbox" id="s-status" style="min-height:0;width:auto">
+            <span>Approved / denied and deny reasons (off: every submission shows as "Received")</span></label>
+        </fieldset>
         <button type="submit">Save</button>
       </form><div id="s-msg" class="msg" hidden></div></div>
 
@@ -129,12 +134,14 @@ async function loadSettings() {
   const { data, error } = await sb.from('settings').select('*').eq('id', 1).single();
   if (error) { showMessage($('#s-msg'), errorText(error), 'error'); return; }
   $('#s-name').value = data.event_name; $('#s-max').value = data.max_attempts; $('#s-open').checked = data.claims_open;
+  $('#s-score').checked = data.rider_sees_score !== false; $('#s-status').checked = data.rider_sees_status !== false;
 }
 
 async function saveSettings(ev) {
   ev.preventDefault();
   const { error } = await sb.from('settings').update({
     event_name: $('#s-name').value.trim(), max_attempts: Number($('#s-max').value), claims_open: $('#s-open').checked,
+    rider_sees_score: $('#s-score').checked, rider_sees_status: $('#s-status').checked,
   }).eq('id', 1);
   showMessage($('#s-msg'), error ? errorText(error) : 'Saved.', error ? 'error' : 'ok');
 }

@@ -12,7 +12,7 @@
   <h1>Leader board</h1>
   <p class="muted" id="updated">Loading...</p>
   <div id="msg" class="msg" hidden></div>
-  <div class="card table-wrap">
+  <div class="card table-wrap" id="board">
     <table class="big-board">
       <thead><tr><th>Finish</th><th>Rider</th><th>Name</th><th class="num">Bonuses</th><th class="num">Score</th></tr></thead>
       <tbody id="rows"></tbody>
@@ -32,8 +32,14 @@ currentScorer().then((who) => {
 
 async function load() {
   const { data, error } = await sb.rpc('leaderboard');
-  if (error) { showMessage($('#msg'), errorText(error), 'error'); return; }
+  if (error) {
+    // P0001 = a rule message from the database (the board is hidden for now), not a failure
+    showMessage($('#msg'), errorText(error), error.code === 'P0001' ? 'info' : 'error');
+    if (error.code === 'P0001') { $('#board').hidden = true; $('#updated').textContent = ''; }
+    return;
+  }
   showMessage($('#msg'), '');
+  $('#board').hidden = false;
   $('#rows').innerHTML = data.map((r) => `<tr>
     <td>${esc(r.finish)}</td><td>${esc(r.rider_number)}</td><td>${esc(r.name)}</td>
     <td class="num">${esc(r.bonuses_counted)}</td><td class="num"><strong>${esc(Number(r.score))}</strong></td></tr>`).join('');

@@ -24,6 +24,8 @@ let bonuses = [];
 let timer = null;
 let tables = {};   // sortable tables for the Table view, one per tab
 let shown = {};    // claims on screen by id (with photo links), for the claim dialog
+let riders = [];   // for the rider summary picker
+let summaryRider = remember('summary_rider', '');
 
 async function start() {
   let who;
@@ -41,6 +43,7 @@ async function start() {
       <button type="button" data-tab="pending">Pending <span id="pending-count"></span></button>
       <button type="button" data-tab="decided">Decided</button>
       <button type="button" data-tab="add">Add claim</button>
+      <button type="button" data-tab="summary">Rider summary</button>
     </div>
     <div class="row"><input type="search" id="filter" class="grow" placeholder="Filter by rider number or bonus code">
       <div class="tabs view-switch" id="view-switch">
@@ -126,8 +129,9 @@ async function render() {
   app.querySelectorAll('[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
   const { count } = await sb.from('claims').select('id', { count: 'exact', head: true }).eq('status', 'pending');
   $('#pending-count').textContent = count != null ? `(${count})` : '';
-  $('#filter').parentElement.hidden = tab === 'add';
-  const tableMode = view === 'table' && tab !== 'add';
+  const own = tab === 'add' || tab === 'summary';   // tabs with their own controls
+  $('#filter').parentElement.hidden = own;
+  const tableMode = view === 'table' && !own;
   // Shows the right container; called once the rows are ready so cards and table never show together
   const showViews = () => {
     app.classList.toggle('wide', tableMode);   // tables get the full screen width on a laptop
@@ -135,6 +139,7 @@ async function render() {
     $('#table-decided').hidden = !(tableMode && tab === 'decided');
   };
   if (tab === 'add') { showViews(); return renderAdd(); }
+  if (tab === 'summary') { showViews(); return renderSummary(); }
 
   let q = sb.from('claims_detail').select('*');
   q = tab === 'pending'
@@ -287,6 +292,80 @@ function renderAdd() {
       ev.target.reset();
     } catch (e) { showMessage(m, errorText(e), 'error'); }
   });
+}
+
+// ---- Rider summary: every claim for one rider in the order sent, with the score. Prints on one
+// sheet to hand to the rider at the finish; the check boxes are for ticking items off together.
+const STATUS_WORD = { approved: 'Approved', denied: 'Denied', pending: 'Pending' };
+
+async function renderSummary() {
+  if (!riders.length) {
+    const { data, error } = await sb.from('riders').select('id,rider_number,name').order('rider_number');
+    if (error) { showMessage($('#msg'), errorText(error), 'error'); return; }
+    riders = data || [];
+  }
+  const keepPick = $('#sum-rider');
+  if (!keepPick) {
+    $('#body').innerHTML = `<div class="row no-print">
+        <select id="sum-rider" class="grow" aria-label="Rider">
+          <option value="">Pick a rider...</option>
+          ${riders.map((r) => `<option value="${esc(r.rider_number)}">${esc(r.rider_number)} - ${esc(r.name)}</option>`).join('')}
+        </select>
+        <button type="button" id="sum-print" disabled>Print</button></div>
+      <div id="sum-sheet"></div>`;
+    $('#sum-rider').value = summaryRider;
+    $('#sum-rider').addEventListener('change', () => { summaryRider = $('#sum-rider').value; keep('summary_rider', summaryRider); renderSummary(); });
+    $('#sum-print').addEventListener('click', () => window.print());
+  }
+  const r = riders.find((x) => String(x.rider_number) === String(summaryRider));
+  $('#sum-print').disabled = !r;
+  if (!r) { $('#sum-sheet').innerHTML = '<p class="muted">Pick a rider to see their claims and score.</p>'; return; }
+
+  const [claims, score, combos, settings] = await Promise.all([
+    sb.from('claims_detail').select('*').eq('rider_id', r.id).order('submitted_at', { ascending: true }),
+    sb.from('rider_scores').select('*').eq('rider_id', r.id).maybeSingle(),
+    sb.from('approved_effective').select('bonus_code').eq('rider_id', r.id).eq('via_combo', true),
+    sb.from('settings').select('event_name').eq('id', 1).maybeSingle(),
+  ]);
+  const err = claims.error || score.error || combos.error;
+  if (err) { showMessage($('#msg'), errorText(err), 'error'); return; }
+  showMessage($('#msg'), '');
+  if (String(r.rider_number) !== String(summaryRider)) return;   // picked another rider meanwhile
+
+  const byCode = Object.fromEntries(bonuses.map((b) => [b.code, b]));
+  const rows = claims.data.map((c, i) => ({
+    n: i + 1, when: fmtTime(c.submitted_at), code: c.bonus_code, name: c.bonus_name, points: c.points,
+    status: c.status, word: STATUS_WORD[c.status] || c.status, reason: c.status === 'denied' ? c.reason : '',
+  }));
+  // Combos that count because every part is approved have no claim of their own: list them last
+  for (const k of (combos.data || []).map((x) => x.bonus_code).sort()) {
+    rows.push({ n: rows.length + 1, when: '', code: k, name: byCode[k]?.name, points: byCode[k]?.points,
+      status: 'approved', word: 'Counted (all parts approved)', reason: '' });
+  }
+  const sc = score.data || { score: 0, base_points: 0, worst_penalty: null };
+  const pending = rows.filter((x) => x.status === 'pending').length;
+  $('#sum-sheet').innerHTML = `<div class="card summary-sheet">
+      <div class="row"><div class="grow">
+          <h2>${esc(settings.data?.event_name || 'Rally')} - rider summary</h2>
+          <p>Rider <strong>${esc(r.rider_number)}</strong> - ${esc(r.name)}</p>
+          <p class="muted">Printed ${esc(fmtTime(new Date().toISOString()))}</p></div>
+        <div class="summary-score"><div class="score-total">${esc(Number(sc.score).toLocaleString())}</div>
+          <div class="muted">total score</div></div></div>
+      ${pending ? `<div class="msg warn">${pending} claim${pending === 1 ? ' is' : 's are'} still pending, so this score may change.</div>` : ''}
+      <div class="table-wrap"><table class="summary">
+        <thead><tr><th class="tick">Check</th><th class="num">#</th><th>Sent</th><th>Bonus</th><th class="num">Points</th><th>Result</th></tr></thead>
+        <tbody>${rows.map((x) => `<tr class="${esc(x.status)}">
+          <td class="tick"><input type="checkbox" aria-label="Check ${esc(x.code)}"></td>
+          <td class="num">${x.n}</td><td>${esc(x.when)}</td>
+          <td><span class="bonus-code">${esc(x.code)}</span> ${esc(x.name || '')}</td>
+          <td class="num">${esc(x.points)}</td>
+          <td><span class="badge ${esc(x.status)}">${esc(x.word)}</span>${x.reason ? `<br><span class="muted">${esc(x.reason)}</span>` : ''}</td>
+        </tr>`).join('') || '<tr><td colspan="6" class="muted">No claims yet.</td></tr>'}</tbody>
+      </table></div>
+      <p class="summary-total">Approved points ${esc(Number(sc.base_points).toLocaleString())}${sc.worst_penalty
+        ? ` with a ${esc(sc.worst_penalty)}% penalty` : ''} = <strong>${esc(Number(sc.score).toLocaleString())}</strong></p>
+      <p class="signature">Rider signature ______________________ &nbsp; Scorer ______________________</p>
+    </div>`;
 }
 
 start();

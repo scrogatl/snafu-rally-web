@@ -434,13 +434,17 @@ test('pages: hostile text shows as text on the rider page', async () => {
   await assertInert(bad.page, bad.errors);
 });
 
-test('pages: hostile text shows as text on the review page (cards, table, dialog)', async () => {
+test('pages: hostile text shows as text on the review page (cards, table, dialog, rider summary)', async () => {
   const { page, errors } = await newPage({
     'POST /rest/v1/rpc/staff_role': () => ({ json: 'scorer' }),
     'GET /rest/v1/bonuses': () => ({ json: [{ code: 'ABCD', name: EVIL, points: 100 }] }),
     'HEAD /rest/v1/claims': () => ({ headers: { 'content-range': '0-0/1' } }),
     'GET /rest/v1/claims_detail': () => ({ json: [claimRow()] }),
     'POST /storage/v1/object/sign/claims': signed,
+    'GET /rest/v1/riders': () => ({ json: [{ id: 5, rider_number: 42, name: EVIL }] }),
+    'GET /rest/v1/rider_scores': () => ({ json: { rider_id: 5, score: 1, base_points: 1, worst_penalty: null } }),
+    'GET /rest/v1/approved_effective': () => ({ json: [] }),
+    'GET /rest/v1/settings': () => ({ json: { event_name: EVIL } }),
   }, { session: true });
   await page.goto(`${APP}scorer.html`);
   await page.locator('.claim').waitFor();
@@ -451,6 +455,10 @@ test('pages: hostile text shows as text on the review page (cards, table, dialog
   await page.getByRole('button', { name: 'Table', exact: true }).click();
   await page.locator('#table-pending [data-act="approved"]').waitFor();
   await page.getByRole('button', { name: 'Add claim' }).click();   // bonus names in the select
+  await page.getByRole('button', { name: 'Rider summary' }).click();   // rider names, event name, reasons
+  await page.selectOption('#sum-rider', '42');
+  await page.locator('.summary-sheet table.summary').waitFor();
+  assert.ok((await page.textContent('.summary-sheet')).includes(EVIL));
   await assertInert(page, errors);
 });
 

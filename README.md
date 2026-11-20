@@ -10,7 +10,7 @@ Full design and rules: [SPEC.md](SPEC.md).
 | Page | Who | What |
 |---|---|---|
 | `rider.html?t=<token>` | Rider | Bonus list, score, photo submit. No login; the link is the key. |
-| `scorer.html` | Scorer | Approve / deny / revert claims as photo cards or a sortable table; open a claim to compare it with the bonus reference photo; add a claim for a rider. |
+| `scorer.html` | Scorer | Approve / deny / revert claims as photo cards or a sortable table; open a claim to compare it with the bonus reference photo; add a claim for a rider; print a rider summary to hand to the rider. |
 | `activity.html` | Scorer | What is happening now: claim feed, which riders have opened their link, scorer sign-ins. |
 | `admin.html` | Admin | Event settings, CSV import, edit riders / bonuses (with reference photo) / combos, rider links, delete all. |
 | `leaderboard.html` | Anyone | Live ranking. |
@@ -78,7 +78,10 @@ Every push to `main` redeploys the site.
 - **Reference photos are public links.** Admins add one per bonus (Admin -> Bonuses -> Edit). Riders
   see it on the bonus page and scorers next to the rider's photo. The file names are random and only
   admins can list them, but anyone given a photo's link can open it.
-- **Riders see deny reasons.** A rider opening a bonus sees each of their submissions, the photo
+- **Hiding results from riders.** Admin -> Event -> "Rider page shows" can turn off the score and the
+  approved / denied results (riders then see every bonus they sent as "Received"). Turning off the
+  score also hides the public leader board; signed-in scorers still see it.
+- **Riders see deny reasons** (unless hidden). A rider opening a bonus sees each of their submissions, the photo
   (on tap) and the scorer's reason. Write reasons for the rider.
 - **Start over:** Admin -> Testing reset (claims only), or run `supabase/reset.sql` then
   `supabase/schema.sql` (everything).
