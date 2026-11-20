@@ -4,8 +4,9 @@
   "description": "SNAFU rally bonus claims and scoring: static web app + Supabase",
   "scripts": {
     "test:setup": "playwright install chromium",
-    "test": "node --test tests/schema.test.mjs tests/web.test.mjs",
+    "test": "node --test tests/schema.test.mjs tests/web.test.mjs tests/security.test.mjs",
     "test:db": "node --test tests/schema.test.mjs",
+    "test:security": "node --test tests/security.test.mjs",
     "serve": "npx --yes serve web -l 8080"
   },
   "author": "",

@@ -19,6 +19,7 @@ the code when behavior changes. Setup steps for people: `README.md`.
   Auth email links for scorers only.
 - Riders never log in. Each rider has a secret `token` in their link (`rider.html?t=...`). All rider
   actions go through SECURITY DEFINER functions that take the token (`rider_session`, `rider_submit`).
+- Rider photo paths must be exactly `<token>/<name>.<ext>` (rider_submit and the upload rule both check).
 - Riders have NO storage read rule (a rule could not tell riders apart, and listing would leak tokens).
   They view their own photos via Edge Function `supabase/functions/rider-photo` (service role,
   `rider_photo_paths(token)`), deployed with `--no-verify-jwt`.
@@ -53,6 +54,7 @@ npm install
 npm run test:setup   # one time, Chromium for browser tests
 npm test             # all tests
 npm run test:db      # schema tests only (PGlite, no Docker, seconds)
+npm run test:security  # security tests (catalog rules, each role, rider isolation, secrets, XSS)
 npm run serve        # pages at http://localhost:8080
 ```
 Local Supabase: `supabase/config.toml` exists (redirects to localhost:8080). No migrations yet; load the
@@ -72,4 +74,9 @@ If migrations become the source of truth, point `tests/schema.test.mjs` at them.
   (`tests/supabase_stubs.sql`) and switches roles (anon, non-scorer, scorer).
   Gotcha: `select (fn()).*` calls fn once per column; use `select * from fn()`.
 - `tests/web.test.mjs`: Playwright loads the real pages against a fake Supabase API. CDN scripts are
-  served from node_modules (supabase-js bundled with esbuild into `tmp/`).
+  served from node_modules (supabase-js bundled with esbuild into `tmp/`). Harness in `tests/browser.mjs`.
+- `tests/security.test.mjs`: checks the DB catalog against allowlists (functions each role may call, table
+  commands, RLS on, security_invoker views, pinned search_path, storage policies), tries attacks as anon /
+  stranger / scorer / admin, scans committed files for secret keys, checks the config script, and loads
+  every page with hostile text. A new table, view or function fails it until it is added to the lists on
+  purpose.

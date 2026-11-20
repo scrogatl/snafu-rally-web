@@ -52,8 +52,9 @@ Principles:
   "description": "SNAFU rally bonus claims and scoring: static web app + Supabase",
   "scripts": {
     "test:setup": "playwright install chromium",
-    "test": "node --test tests/schema.test.mjs tests/web.test.mjs",
+    "test": "node --test tests/schema.test.mjs tests/web.test.mjs tests/security.test.mjs",
     "test:db": "node --test tests/schema.test.mjs",
+    "test:security": "node --test tests/security.test.mjs",
     "serve": "npx --yes serve web -l 8080"
   },
   "license": "GPL-3.0-or-later",
@@ -95,6 +96,8 @@ supabase/functions/rider-photo/index.ts  Edge Function: signed links to a rider'
 tests/supabase_stubs.sql   minimal auth/storage/roles stand-ins for PGlite
 tests/schema.test.mjs      DB tests
 tests/web.test.mjs         browser tests
+tests/browser.mjs          shared browser harness (fake Supabase API, Chromium)
+tests/security.test.mjs    security tests
 web/config.js              SUPABASE_URL, SUPABASE_ANON_KEY (committed = local values)
 web/serve.json             { "cleanUrls": false }
 web/lib.js                 shared helpers
@@ -272,7 +275,8 @@ p_note text default null, p_taken_at timestamptz default null) returns json`** (
 3. If not `claims_open`: `'Claims are closed.'`
 4. Code (upper/trim) unknown or points < 0: `'Unknown bonus code %.'`
 5. No photo and not a combo: `'A photo is required for bonus %.'`
-6. Photo path not starting with `<token>/`: `'Photo does not belong to this rider.'`
+6. Photo path not exactly `<token>/<name>.<ext>` (name `[0-9A-Za-z_-]+`, ext 1-5 letters/digits; so no
+   other folder, sub folder or `..`): `'Photo does not belong to this rider.'`
 7. Already approved: `'Bonus % is already approved for you.'`
 8. Attempts >= max: `'You have used all % attempts for bonus %. See rally staff.'`
 9. Insert with `note = nullif(trim(p_note), '')`, `submitted_by = 'rider ' || rider_number`.
@@ -339,8 +343,8 @@ Security definer, callable by anon.
   values ('claims', 'claims', false, 10485760, array['image/jpeg','image/png','image/webp','image/heic','image/heif'])
   on conflict (id) do nothing;`
 - Policies on `storage.objects`:
-  - `rider_upload` FOR INSERT to anon, authenticated: `bucket_id = 'claims' and
-    public.rider_token_valid((storage.foldername(name))[1])`
+  - `rider_upload` FOR INSERT to anon, authenticated: `bucket_id = 'claims'`, name matches
+    `^[0-9a-fA-F-]{36}/[0-9A-Za-z_-]+\.[A-Za-z0-9]{1,5}$`, and `public.rider_token_valid(split_part(name, '/', 1))`
   - `scorer_upload` FOR INSERT to authenticated: bucket `claims` and `public.is_scorer()`
   - `scorer_read_photos` FOR SELECT to authenticated: bucket `claims` and `public.is_scorer()`
 - Paths: riders `<token>/<client_id>.<ext>`; scorers `scorer/<uuid>.<ext>`.
@@ -405,7 +409,8 @@ iss `supabase-demo`).
   `'Setup needed: open web/config.js and fill in SUPABASE_URL and SUPABASE_ANON_KEY.'`
 - `shrinkImage(file, maxEdge=1600, quality=0.8)`: `createImageBitmap(file, {imageOrientation:'from-image'})`,
   scale longest edge to <= 1600, canvas -> JPEG blob; returns `{blob, ext:'jpg', type:'image/jpeg', shrunk:true}`.
-  On any failure (e.g. HEIC on Android) return the original file `{blob:file, ext, type, shrunk:false}`.
+  On any failure (e.g. HEIC on Android) return the original file `{blob:file, ext, type, shrunk:false}`;
+  `ext` is the file's own extension if it is 1-5 letters/digits, else `jpg` (the database checks the path).
   Canvas re-encoding drops photo metadata (intended for now).
 - `newId()`: `crypto.randomUUID` with a `getRandomValues` fallback (plain-http testing).
 - `currentScorer()`: `{session, role, isScorer, isAdmin}` via `sb.auth.getSession()` and `rpc('staff_role')`.
@@ -428,6 +433,7 @@ Title "Rally Scoring". Card: "Riders: use the personal link the rally staff sent
 leader board, scorer review, activity, admin.
 
 ### 5.4 `rider.html` (most important; beginners on phones)
+- `<meta name="referrer" content="no-referrer">` (the address holds the token).
 - Token from `?t=`; saved to `localStorage.rally_token`; if absent, read from localStorage
   (so a home-screen icon works). Wrap storage in try/catch. No token:
   `'Open this page from your personal rider link.'`
@@ -612,7 +618,9 @@ with comments: set the two env vars in Netlify; both are public by design.
   `postgresql://` string would leak the DB password). Hostname ending `supabase.com` -> exit 1
   ("dashboard address, not the project API").
 - Keep only `origin` (strip pasted `/rest/v1/` etc.), warn if trimmed.
-- Key containing whitespace, quotes or backslash -> exit 1.
+- Key containing whitespace, quotes or backslash -> exit 1. Key starting `sb_secret_`, or a JWT whose
+  role is not `anon` (e.g. `service_role`) -> exit 1 (this file is public). Never echoes the URL or key;
+  the trim note shows only the trimmed origin. `CONFIG_OUT` env overrides the output path (tests only).
 - Write `web/config.js` with a "Generated ... Do not edit here." header. Each error includes the hint
   `Use the Project URL from Supabase -> Project Settings -> API, like https://abcd1234.supabase.co`.
 
@@ -695,6 +703,35 @@ Load stubs then the real `supabase/schema.sql`. Helpers switch role with `set ro
   15. admin: edit riders, bonuses with a reference photo, combos; delete all
   Scorer tests also check the nav has no Admin link for a plain scorer.
 
+### 7.4 `tests/security.test.mjs`
+Own PGlite database (stubs + schema) with roles anon, stranger (signed in, not a scorer), scorer, admin;
+riders 1 and 2. Browser parts use `tests/browser.mjs`. Tests:
+- Catalog: functions callable by anon / authenticated equal fixed allowlists (extension functions
+  skipped); every security definer function sets `search_path`; every table has RLS; every view has
+  `security_invoker=true`; table privileges equal a fixed map for authenticated and nothing for anon (no
+  TRUNCATE anywhere; a new table or view fails until listed); public policies only to authenticated;
+  storage policies and bucket privacy exactly as expected.
+- anon: no read/write on any table or view; no scorer/admin/internal function, even with an admin email
+  in the JWT claims.
+- stranger: zero rows everywhere, writes refused or touch nothing, scorer and admin functions refused.
+- scorer: cannot change `scorers` (no self-promotion; admins cannot either from the pages), cannot change
+  the event setup or call admin functions.
+- scorer and admin: no direct insert/update/delete/truncate on claims or claim_events; decisions are
+  logged with the signed-in email.
+- riders: other rider's photo, `..` paths, sub folders, `scorer/` refused; reused submission id refused
+  without revealing the claim; rider_session holds nothing of another rider, no emails, no penalties;
+  leaderboard columns fixed; bad / old tokens refused, new link kills the old; SQL-like codes are just
+  unknown codes; penalties not claimable; note and reason length limits.
+- storage: rider uploads only `<own token>/<name>.<ext>`; reference photos only by admins; anon,
+  strangers and scorers cannot list rider folders (tokens) or reference photos.
+- files: no committed JWT other than role anon, no `sb_secret_`, no database password; pages load only
+  the two pinned CDN scripts; no inline `on...=` handlers; rider page has the no-referrer meta.
+- config script: refuses service_role and `sb_secret_` keys without echoing them; never prints a password
+  from a URL; accepts anon and publishable keys.
+- pages: a hostile string (`"'><img src=x onerror=...><script>...`) as event name, names, notes, reasons,
+  emails, actions and error messages renders as text on rider, review (cards, table, dialog, add form),
+  activity, admin (lists and edit fields) and leader board pages; nothing runs.
+
 All tests must pass with `npm test` before the work is called done.
 
 ---
@@ -743,7 +780,7 @@ ARSN,WXYZ
 
 ## 10. Done when
 
-1. `npm install && npm run test:setup && npm test` passes all 30 tests.
+1. `npm install && npm run test:setup && npm test` passes all 51 tests.
 2. Pasting `schema.sql` into a fresh Supabase project runs without errors, and running it twice is harmless.
 3. Following README setup with the `samples/` CSVs, a rider can submit from a phone, a scorer can
    approve, and the leader board shows the score (ABCD + WXYZ approved = 175 with combo ARSN).

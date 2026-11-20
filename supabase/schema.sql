@@ -389,7 +389,9 @@ begin
   if p_photo_path is null and not is_combo(v_code) then
     raise exception 'A photo is required for bonus %.', v_code using errcode = 'P0001';
   end if;
-  if p_photo_path is not null and p_photo_path not like p_token::text || '/%' then
+  -- Exactly <token>/<file name>.<ext>: no other rider's folder, no sub folders, no "../" tricks
+  if p_photo_path is not null
+     and p_photo_path !~ ('^' || p_token::text || '/[0-9A-Za-z_-]+\.[A-Za-z0-9]{1,5}$') then
     raise exception 'Photo does not belong to this rider.' using errcode = 'P0001';
   end if;
 
@@ -657,9 +659,12 @@ values ('claims', 'claims', false, 10485760,
         array['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'])
 on conflict (id) do nothing;
 
+-- Rider uploads must be exactly <token>/<file name>.<ext> (no sub folders, no "..")
 drop policy if exists rider_upload on storage.objects;
 create policy rider_upload on storage.objects for insert to anon, authenticated
-  with check (bucket_id = 'claims' and public.rider_token_valid((storage.foldername(name))[1]));
+  with check (bucket_id = 'claims'
+              and name ~ '^[0-9a-fA-F-]{36}/[0-9A-Za-z_-]+\.[A-Za-z0-9]{1,5}$'
+              and public.rider_token_valid(split_part(name, '/', 1)));
 
 drop policy if exists scorer_upload on storage.objects;
 create policy scorer_upload on storage.objects for insert to authenticated

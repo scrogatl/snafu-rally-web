@@ -61,8 +61,9 @@ export async function shrinkImage(file, maxEdge = 1600, quality = 0.8) {
     return { blob, ext: 'jpg', type: 'image/jpeg', shrunk: true };
   } catch (e) {
     console.warn('Shrink skipped, uploading original:', e);
-    const ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
-    return { blob: file, ext, type: file.type || 'image/jpeg', shrunk: false };
+    // Keep a plain extension only; the database accepts <id>.<1-5 letters or digits>
+    const ext = (file.name.includes('.') ? file.name.split('.').pop() : '').toLowerCase();
+    return { blob: file, ext: /^[a-z0-9]{1,5}$/.test(ext) ? ext : 'jpg', type: file.type || 'image/jpeg', shrunk: false };
   }
 }
 

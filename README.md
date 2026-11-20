@@ -93,7 +93,8 @@ Needs Node 20+.
 ```
 npm install
 npm run test:setup   # one time: Chromium for the browser tests
-npm test             # database rules (PGlite) + pages (headless Chromium)
+npm test             # database rules (PGlite) + pages (headless Chromium) + security tests
+npm run test:security  # security tests only
 npm run serve        # pages at http://localhost:8080
 ```
 
